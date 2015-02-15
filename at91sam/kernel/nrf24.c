@@ -5,6 +5,17 @@
 #include <linux/spi/spi.h>
 #include <linux/interrupt.h>
 //#include <linux/irqreturn.h>
+
+#include <linux/init.h>
+#include <linux/ioctl.h>
+#include <linux/fs.h>
+#include <linux/err.h>
+#include <linux/list.h>
+#include <linux/errno.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
+#include <asm/uaccess.h>
+
 #include "nRF24L01.h"
 
 #define DRIVER_NAME		"nrf24_spi"
@@ -15,8 +26,15 @@
 #define SPI_MAX_TRANSFERS	8
 #define BUFFER_SIZE		(FIFO_SIZE+4)
 
+
+#define SPIDEV_MAJOR                    153     /* assigned */
+#define N_SPI_MINORS                    32      /* ... up to 256 */
+
+static DECLARE_BITMAP(minors, N_SPI_MINORS);
+
 struct nrf24_chip {
 	struct spi_device *spi;
+	dev_t                   devt;
 //	struct nrf24_channel channel[6];
 	spinlock_t              lock;
 	u8		pending;	/* Async transfer active (only one at a time)*/
@@ -245,13 +263,16 @@ nrf24dev_write(struct file *filp, const char __user *buf,
 static long
 nrf24dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-#if 0
-	spidev = filp->private_data;
-	spin_lock_irq(&spidev->spi_lock);
-	spi = spi_dev_get(spidev->spi);
-	spin_unlock_irq(&spidev->spi_lock);
+#if 1
+	struct nrf24_chip *ts;
+	struct spi_device	*spi;
 
-	dev_info(&spi->dev, TYPE_NAME " status %d\n",get_status(ts));
+	ts = filp->private_data;
+	spin_lock_irq(&ts->lock);
+	spi = spi_dev_get(ts->spi);
+	spin_unlock_irq(&ts->lock);
+
+	dev_info(&spi->dev, TYPE_NAME " Command %d, status %x\n",cmd,(unsigned int)get_status(ts));
 #endif
 /*
 	switch (cmd)
@@ -278,6 +299,7 @@ static const struct file_operations nrf24_fops = {
 //	.llseek =	no_llseek,
 };
 
+static struct class *nrf24_class;
 
 /* ******************************** INIT ********************************* */
 
@@ -285,7 +307,7 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 {
 	struct nrf24_chip *ts;
 	struct nrf24_platform_data *pdata;
-	int ret;
+//	int ret;
 
 	/* Get platform data for  module */
 	pdata = spi->dev.platform_data;
@@ -333,29 +355,30 @@ payload_size = 8;
 			spi->chip_select, spi->irq);
 
 
-	dev_info(&spi->dev, TYPE_NAME " status %d\n",get_status(ts));
-#if 0
+	dev_info(&spi->dev, TYPE_NAME " status %x\n",get_status(ts));
+#if 1
 	/* If we can allocate a minor number, hook up this device.
 	 * Reusing minors is fine so long as udev or mdev is working.
 	 */
-	mutex_lock(&device_list_lock);
+#if 0 //MULTICHANNEL
 	minor = find_first_zero_bit(minors, N_SPI_MINORS);
 	if (minor < N_SPI_MINORS) {
+#endif
 		struct device *dev;
+		int minor = 1;
 
-		spidev->devt = MKDEV(SPIDEV_MAJOR, minor);
-		dev = device_create(spidev_class, &spi->dev, spidev->devt,
-				    spidev, "spidev%d.%d",
-				    spi->master->bus_num, spi->chip_select);
-		status = IS_ERR(dev) ? PTR_ERR(dev) : 0;
+		ts->devt = MKDEV(SPIDEV_MAJOR, minor);
+		dev = device_create(nrf24_class, &spi->dev, ts->devt,
+				    ts, "radio%d",
+				    spi->chip_select);
+//		ret = IS_ERR(dev) ? PTR_ERR(dev) : 0;
+#if 0 //MULTICHANNEL
 	} else {
 		dev_dbg(&spi->dev, "no minor number available!\n");
 		status = -ENODEV;
 	}
+#endif
 
-	status = register_chrdev(SPIDEV_MAJOR, "nrf24", &nrf24_fops);
-	if (status < 0)
-		return status;
 #endif
 
 	return 0;
@@ -374,8 +397,19 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 	if (ts == NULL)
 		return -ENODEV;
 
+	/* make sure ops on existing fds can abort cleanly */
+	spin_lock_irq(&ts->lock);
+	ts->spi = NULL;
+	spi_set_drvdata(spi, NULL);
+	spin_unlock_irq(&ts->lock);
+
 	/* Free the interrupt */
-	free_irq(ts->spi->irq, chan);
+	free_irq(ts->spi->irq, ts);
+
+	/* prevent new opens */
+	device_destroy(nrf24_class, ts->devt);
+	clear_bit(MINOR(ts->devt), minors);
+
 
 	kfree(ts->transfers); /* Free the async SPI transfer structures */
 	kfree(ts->spiBuf); /* Free the async SPI transfer buffer */
@@ -399,13 +433,29 @@ static struct spi_driver nrf24_spi_driver = {
 /* Driver init function */
 static int __init nrf24_init(void)
 {
-	return spi_register_driver(&nrf24_spi_driver);
+	int status;
+	status = register_chrdev(SPIDEV_MAJOR, "nrf24", &nrf24_fops);
+	if (status < 0)
+		return status;
+	nrf24_class = class_create(THIS_MODULE, "nrf24dev");
+	if (IS_ERR(nrf24_class)) {
+		unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
+		return PTR_ERR(nrf24_class);
+	}
+
+	status = spi_register_driver(&nrf24_spi_driver);
+	if (status < 0) {
+		class_destroy(nrf24_class);
+		unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
+	}
+	return status;
 }
 
 /* Driver exit function */
 static void __exit nrf24_exit(void)
 {
 	spi_unregister_driver(&nrf24_spi_driver);
+	class_destroy(nrf24_class);
 	unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
 }
 
