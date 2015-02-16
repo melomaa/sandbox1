@@ -4,7 +4,8 @@
 #include <linux/gpio.h>
 #include <linux/spi/spi.h>
 #include <linux/interrupt.h>
-//#include <linux/irqreturn.h>
+#include <linux/delay.h>
+
 
 #include <linux/init.h>
 #include <linux/ioctl.h>
@@ -15,6 +16,8 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <asm/uaccess.h>
+
+#include <linux/nrf24.h>
 
 #include "nRF24L01.h"
 
@@ -30,6 +33,12 @@
 #define SPIDEV_MAJOR                    153     /* assigned */
 #define N_SPI_MINORS                    32      /* ... up to 256 */
 
+#define LOW	0
+#define HIGH	1
+
+
+#define _BV(x) (1<<(x))
+
 static DECLARE_BITMAP(minors, N_SPI_MINORS);
 
 struct nrf24_chip {
@@ -44,6 +53,7 @@ struct nrf24_chip {
         struct spi_transfer     *transfers; /* Transfer structs for the async message */
 	u8 		*spiBuf;	/* Buffer for message data */
 	u8		*txbuf;
+	bool		p_variant;
 };
 
 struct nrf24_platform_data {
@@ -52,7 +62,7 @@ struct nrf24_platform_data {
 
   uint8_t ce_pin; /**< "Chip Enable" pin, activates the RX or TX role */
 //  uint8_t csn_pin; /**< SPI Chip select */
-//  bool wide_band; /* 2Mbs data rate in use? */
+  bool wide_band; /* 2Mbs data rate in use? */
 //  bool p_variant; /* False for RF24L01 and true for RF24L01P */
   uint8_t payload_size; /**< Fixed size of payloads */
 //  bool ack_payload_available; /**< Whether there is an ack payload waiting */
@@ -144,6 +154,199 @@ uint8_t write_payload(const void* buf, uint8_t len)
 
   return status;
 }
+
+/* ******************************** CONFIG ********************************* */
+
+void toggle_features(void)
+{
+  p_ts->txbuf[0] = ACTIVATE;
+  p_ts->txbuf[1] = 0x73; 
+  nrf24_write(p_ts, 2);
+  return;
+}
+
+void enableAckPayload(void)
+{
+  //
+  // enable ack payload and dynamic payload features
+  //
+
+  write_register(FEATURE,read_register(FEATURE) | _BV(EN_ACK_PAY) | _BV(EN_DPL) );
+
+  // If it didn't work, the features are not enabled
+  if ( ! read_register(FEATURE) )
+  {
+    // So enable them and try again
+    toggle_features();
+    write_register(FEATURE,read_register(FEATURE) | _BV(EN_ACK_PAY) | _BV(EN_DPL) );
+  }
+
+  //
+  // Enable dynamic payload on pipes 0 & 1
+  //
+
+  write_register(DYNPD,read_register(DYNPD) | _BV(DPL_P1) | _BV(DPL_P0));
+}
+
+void enableDynamicPayloads(void)
+{
+  // Enable dynamic payload throughout the system
+  write_register(FEATURE,read_register(FEATURE) | _BV(EN_DPL) );
+
+  // If it didn't work, the features are not enabled
+  if ( ! read_register(FEATURE) )
+  {
+    // So enable them and try again
+    toggle_features();
+    write_register(FEATURE,read_register(FEATURE) | _BV(EN_DPL) );
+  }
+
+  // Enable dynamic payload on all pipes
+  //
+  // Not sure the use case of only having dynamic payload on certain
+  // pipes, so the library does not support it.
+  write_register(DYNPD,read_register(DYNPD) | _BV(DPL_P5) | _BV(DPL_P4) | _BV(DPL_P3) | _BV(DPL_P2) | _BV(DPL_P1) | _BV(DPL_P0));
+
+  dynamic_payloads_enabled = true;
+}
+
+void setAutoAck( uint8_t pipe, bool enable )
+{
+  if ( pipe <= 6 )
+  {
+    uint8_t en_aa = read_register( EN_AA ) ;
+    if( enable )
+    {
+      en_aa |= _BV(pipe) ;
+    }
+    else
+    {
+      en_aa &= ~_BV(pipe) ;
+    }
+    write_register( EN_AA, en_aa ) ;
+  }
+}
+
+void setChannel(uint8_t channel)
+{
+  // TODO: This method could take advantage of the 'wide_band' calculation
+  // done in setChannel() to require certain channel spacing.
+
+  const uint8_t max_channel = 127;
+  write_register(RF_CH,min(channel,max_channel));
+}
+
+void setCRCLength(rf24_crclength_e length)
+{
+  uint8_t config = read_register(CONFIG) & ~( _BV(CRCO) | _BV(EN_CRC)) ;
+  
+  // switch uses RAM (evil!)
+  if ( length == RF24_CRC_DISABLED )
+  {
+    // Do nothing, we turned it off above. 
+  }
+  else if ( length == RF24_CRC_8 )
+  {
+    config |= _BV(EN_CRC);
+  }
+  else
+  {
+    config |= _BV(EN_CRC);
+    config |= _BV( CRCO );
+  }
+  write_register( CONFIG, config ) ;
+}
+
+
+bool setDataRate(rf24_datarate_e speed)
+{
+  bool result = false;
+  uint8_t setup = read_register(RF_SETUP) ;
+
+  // HIGH and LOW '00' is 1Mbs - our default
+  wide_band = false ;
+  setup &= ~(_BV(RF_DR_LOW) | _BV(RF_DR_HIGH)) ;
+  if( speed == RF24_250KBPS )
+  {
+    // Must set the RF_DR_LOW to 1; RF_DR_HIGH (used to be RF_DR) is already 0
+    // Making it '10'.
+    wide_band = false ;
+    setup |= _BV( RF_DR_LOW ) ;
+  }
+  else
+  {
+    // Set 2Mbs, RF_DR (RF_DR_HIGH) is set 1
+    // Making it '01'
+    if ( speed == RF24_2MBPS )
+    {
+      wide_band = true ;
+      setup |= _BV(RF_DR_HIGH);
+    }
+    else
+    {
+      // 1Mbs
+      wide_band = false ;
+    }
+  }
+  write_register(RF_SETUP,setup);
+
+  // Verify our result
+  if ( read_register(RF_SETUP) == setup )
+  {
+    result = true;
+  }
+  else
+  {
+    wide_band = false;
+  }
+
+  return result;
+}
+
+void setPALevel(rf24_pa_dbm_e level)
+{
+  uint8_t setup = read_register(RF_SETUP) ;
+  setup &= ~(_BV(RF_PWR_LOW) | _BV(RF_PWR_HIGH)) ;
+
+  // switch uses RAM (evil!)
+  if ( level == RF24_PA_MAX )
+  {
+    setup |= (_BV(RF_PWR_LOW) | _BV(RF_PWR_HIGH)) ;
+  }
+  else if ( level == RF24_PA_HIGH )
+  {
+    setup |= _BV(RF_PWR_HIGH) ;
+  }
+  else if ( level == RF24_PA_LOW )
+  {
+    setup |= _BV(RF_PWR_LOW);
+  }
+  else if ( level == RF24_PA_MIN )
+  {
+    // nothing
+  }
+  else if ( level == RF24_PA_ERROR )
+  {
+    // On error, go to maximum PA
+    setup |= (_BV(RF_PWR_LOW) | _BV(RF_PWR_HIGH)) ;
+  }
+
+  write_register( RF_SETUP, setup ) ;
+}
+
+void setPayloadSize(uint8_t size)
+{
+  const uint8_t max_payload_size = 32;
+  payload_size = min(size,max_payload_size);
+}
+
+void setRetries(uint8_t delay, uint8_t count)
+{
+ write_register(SETUP_RETR,(delay&0xf)<<ARD | (count&0xf)<<ARC);
+}
+
+
+/* ******************************** IRQ ********************************* */
 
 void nrf24_callback(void *data)
 {
@@ -245,6 +448,20 @@ uint8_t RF24::read_payload(void* buf, uint8_t len)
 }
 */
 
+/* ******************************** FOPS ********************************* */
+
+
+static int nrf24_open(struct inode *inode, struct file *filp)
+{
+  // Flush buffers
+  flush_rx();
+  flush_tx();
+
+  powerUp(); //Power up by default when open() is called
+
+  return 0;
+}
+
 /* Read-only message with current device setup */
 static ssize_t
 nrf24dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
@@ -294,7 +511,7 @@ static const struct file_operations nrf24_fops = {
 	.read =		nrf24dev_read,
 	.unlocked_ioctl = nrf24dev_ioctl,
 //	.compat_ioctl = spidev_compat_ioctl,
-//	.open =		spidev_open,
+	.open =		nrf24_open,
 //	.release =	spidev_release,
 //	.llseek =	no_llseek,
 };
@@ -302,6 +519,49 @@ static const struct file_operations nrf24_fops = {
 static struct class *nrf24_class;
 
 /* ******************************** INIT ********************************* */
+int default_configuration(struct nrf24_chip *ts)
+{
+	msleep(5);
+  // Set 1500uS (minimum for 32B payload in ESB@250KBPS) timeouts, to make testing a little easier
+  // WARNING: If this is ever lowered, either 250KBS mode with AA is broken or maximum packet
+  // sizes must never be used. See documentation for a more complete explanation.
+  //write_register(SETUP_RETR,(0b0100 << ARD) | (0b1111 << ARC));
+  setRetries(5,15);
+
+  // Restore our default PA level
+  setPALevel( RF24_PA_MAX ) ;
+  // Determine if this is a p or non-p RF24 module and then
+  // reset our data rate back to default value. This works
+  // because a non-P variant won't allow the data rate to
+  // be set to 250Kbps.
+  if( setDataRate( RF24_250KBPS ) )
+  {
+    ts->p_variant = true ;
+  }
+
+  // Then set the data rate to the slowest (and most reliable) speed supported by all
+  // hardware.
+  setDataRate( RF24_1MBPS ) ;
+
+  // Initialize CRC and request 2-byte (16bit) CRC
+  setCRCLength( RF24_CRC_16 ) ;
+ 
+  // Disable dynamic payloads, to match dynamic_payloads_enabled setting
+  toggle_features();
+  //write_register(FEATURE,0 );
+  write_register(DYNPD,0);
+
+  // Reset current status
+  // Notice reset and flush is the last thing we do
+  write_register(STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+
+  // Set up default configuration.  Callers can always change it later.
+  // This channel should be universally safe and not bleed over into adjacent
+  // spectrum.
+  setChannel(76);
+
+  return 0;
+}
 
 static int __devinit nrf24_probe(struct spi_device *spi)
 {
@@ -312,6 +572,8 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 	/* Get platform data for  module */
 	pdata = spi->dev.platform_data;
 
+	ce_pin = 111; /* AT91_PIN_PD15 */
+	ce(LOW);
 
 	ts = kzalloc(sizeof(struct nrf24_chip), GFP_KERNEL);
 	if (!ts)
@@ -380,6 +642,7 @@ payload_size = 8;
 #endif
 
 #endif
+	default_configuration(ts);
 
 	return 0;
 
