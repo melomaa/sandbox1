@@ -17,8 +17,7 @@
 #include <linux/slab.h>
 #include <asm/uaccess.h>
 
-#include <linux/nrf24.h>
-
+#include "nrf24.h"
 #include "nRF24L01.h"
 
 #define DRIVER_NAME		"nrf24_spi"
@@ -54,6 +53,7 @@ struct nrf24_chip {
 	u8 		*spiBuf;	/* Buffer for message data */
 	u8		*txbuf;
 	bool		p_variant;
+	uint64_t	pipe0_reading_address;
 };
 
 struct nrf24_platform_data {
@@ -70,7 +70,7 @@ struct nrf24_platform_data {
 //  uint8_t ack_payload_length; /**< Dynamic size of pending ack payload. */
 //  uint64_t pipe0_reading_address; /**< Last address set on pipe 0 for reading. */
 
-struct nrf24_chip *p_ts;
+static struct nrf24_chip *p_ts;
 
 /* ******************************** SPI ********************************* */
 
@@ -101,6 +101,22 @@ void ce(int level)
   at91_set_gpio_value(ce_pin,level);
 }
 
+uint8_t read_buffer_from_register(uint8_t reg, uint8_t* buf, uint8_t len)
+{
+  struct nrf24_chip *ts = p_ts;
+ // uint8_t* first = buf;
+/*  int status = nrf24_read(ts,reg);
+
+  while ( len-- )
+    *buf++ = spi_w8r8(ts->spi,0xff);
+*/
+  ts->txbuf[0] = (R_REGISTER | ( REGISTER_MASK & reg ));
+  spi_write_then_read(ts->spi, ts->txbuf, 1, buf, len);
+
+  printk("\nRxBuf(%d) %x: %x %x\n", len, reg, buf[0], buf[1]);
+  return len;
+}
+
 uint8_t read_register(uint8_t reg)
 {
   struct nrf24_chip *ts = p_ts;
@@ -110,12 +126,13 @@ uint8_t read_register(uint8_t reg)
   return (uint8_t)result;
 }
 
-uint8_t write_buffer(uint8_t reg, const uint8_t* buf, uint8_t len)
+uint8_t write_buffer_to_register(uint8_t reg, const uint8_t* buf, uint8_t len)
 {
   uint8_t status;
   struct nrf24_chip *ts = p_ts;
   ts->txbuf[0] = (W_REGISTER | ( REGISTER_MASK & reg ));
   memcpy(&ts->txbuf[1],buf,len);
+  printk("\nWriteBuf(%d)%x: %x%x%x%x\n",len,ts->txbuf[0],ts->txbuf[1],ts->txbuf[2],ts->txbuf[3],ts->txbuf[4]);
   status = nrf24_write(ts, len+1);
 
   return status;
@@ -155,7 +172,34 @@ uint8_t write_payload(const void* buf, uint8_t len)
   return status;
 }
 
+
+
 /* ******************************** CONFIG ********************************* */
+
+uint8_t flush_rx(void)
+{
+  uint8_t status;
+
+  p_ts->txbuf[0] = ( FLUSH_RX );
+  status = nrf24_write(p_ts, 1);
+
+  return status;
+}
+
+uint8_t flush_tx(void)
+{
+  uint8_t status;
+
+  p_ts->txbuf[0] = ( FLUSH_TX );
+  status = nrf24_write(p_ts, 1);
+
+  return status;
+}
+
+void powerUp(void)
+{
+  write_register(CONFIG,read_register(CONFIG) | _BV(PWR_UP));
+}
 
 void toggle_features(void)
 {
@@ -345,6 +389,57 @@ void setRetries(uint8_t delay, uint8_t count)
  write_register(SETUP_RETR,(delay&0xf)<<ARD | (count&0xf)<<ARC);
 }
 
+void openWritingPipe(uint64_t value)
+{
+  const uint8_t max_payload_size = 32;
+
+  // Note that AVR 8-bit uC's store this LSB first, and the NRF24L01(+)
+  // expects it LSB first too, so we're good.
+  write_buffer_to_register(RX_ADDR_P0, (uint8_t*)(&value), 5);
+  write_buffer_to_register(TX_ADDR, (uint8_t*)(&value), 5);
+
+  write_register(RX_PW_P0,min(payload_size,max_payload_size));
+}
+
+static const uint8_t child_pipe[] =
+{
+  RX_ADDR_P0, RX_ADDR_P1, RX_ADDR_P2, RX_ADDR_P3, RX_ADDR_P4, RX_ADDR_P5
+};
+static const uint8_t child_payload_size[] =
+{
+  RX_PW_P0, RX_PW_P1, RX_PW_P2, RX_PW_P3, RX_PW_P4, RX_PW_P5
+};
+static const uint8_t child_pipe_enable[] =
+{
+  ERX_P0, ERX_P1, ERX_P2, ERX_P3, ERX_P4, ERX_P5
+};
+
+void openReadingPipe(struct nrf24_chip *ts, uint8_t child, uint64_t address)
+{
+  // If this is pipe 0, cache the address.  This is needed because
+  // openWritingPipe() will overwrite the pipe 0 address, so
+  // startListening() will have to restore it.
+  if (child == 0)
+    ts->pipe0_reading_address = address;
+
+  if (child <= 6)
+  {
+    // For pipes 2-5, only write the LSB
+ 
+	  if ( child < 2 ) {
+		  write_buffer_to_register(child_pipe[child], (uint8_t*)(&address), 5);
+	  }
+	  else {
+		  write_register(child_pipe[child], (uint8_t)address);
+	  }
+	  write_register(child_payload_size[child],payload_size);
+
+    // Note it would be more efficient to set all of the bits for all open
+    // pipes at once.  However, I thought it would make the calling code
+    // more simple to do it this way.
+    write_register(EN_RXADDR,read_register(EN_RXADDR) | _BV(child_pipe_enable[child]));
+  }
+}
 
 /* ******************************** IRQ ********************************* */
 
@@ -459,6 +554,8 @@ static int nrf24_open(struct inode *inode, struct file *filp)
 
   powerUp(); //Power up by default when open() is called
 
+  filp->private_data =p_ts;
+
   return 0;
 }
 
@@ -480,24 +577,28 @@ nrf24dev_write(struct file *filp, const char __user *buf,
 static long
 nrf24dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-#if 1
 	struct nrf24_chip *ts;
 	struct spi_device	*spi;
+
+printk(" Command %d, pointer %x\n",cmd,(int)filp->private_data);
+#if 1
+
 
 	ts = filp->private_data;
 	spin_lock_irq(&ts->lock);
 	spi = spi_dev_get(ts->spi);
 	spin_unlock_irq(&ts->lock);
 
-	dev_info(&spi->dev, TYPE_NAME " Command %d, status %x\n",cmd,(unsigned int)get_status(ts));
+	
 #endif
-/*
+
 	switch (cmd)
 	{
-	  case 0:
+	  case 63:
+		dev_info(&spi->dev, TYPE_NAME " Status %x\n",(unsigned int)get_status(ts));
 		
 	}
-*/
+
 	return 0;
 }
 
@@ -519,6 +620,58 @@ static const struct file_operations nrf24_fops = {
 static struct class *nrf24_class;
 
 /* ******************************** INIT ********************************* */
+void print_byte_register(const char* name, uint8_t reg, uint8_t qty)
+{
+  printk("\t%s =",name);
+  while (qty--)
+    printk(" 0x%02x ",read_register(reg++));
+  printk("\r\n");
+}
+
+void print_address_register(const char* name, uint8_t reg, uint8_t qty)
+{
+  printk("\t%s =",name);
+
+  while (qty--)
+  {
+    uint8_t buffer[5];
+    uint8_t* bufptr;
+    read_buffer_from_register(reg++,buffer,sizeof buffer);
+
+    printk(" 0x");
+    bufptr = buffer + sizeof buffer;
+    while( --bufptr >= buffer )
+      printk("%02x",*bufptr);
+  }
+
+  printk("\r\n");
+}
+
+void printDetails(void)
+{
+  printk("Status %x\n",get_status(p_ts));
+
+  print_address_register("RX_ADDR_P0-1",RX_ADDR_P0,2);
+  print_byte_register("RX_ADDR_P2-5",RX_ADDR_P2,4);
+  print_address_register("TX_ADDR",TX_ADDR,1);
+
+  print_byte_register("RX_PW_P0-6",RX_PW_P0,6);
+  print_byte_register("EN_AA",EN_AA,1);
+  print_byte_register("EN_RXADDR",EN_RXADDR,1);
+  print_byte_register("RF_CH",RF_CH,1);
+  print_byte_register("RF_SETUP",RF_SETUP,1);
+  print_byte_register("CONFIG",CONFIG,1);
+  print_byte_register("DYNPD/FEATURE",DYNPD,2);
+
+/*
+  printf_P(PSTR("Data Rate\t = %s\r\n"),rf24_datarate_e_str_P[getDataRate()]);
+  printf_P(PSTR("Model\t\t = %s\r\n"),rf24_model_e_str_P[isPVariant()]);
+  printf_P(PSTR("CRC Length\t = %s\r\n"),rf24_crclength_e_str_P[getCRCLength()]);
+  printf_P(PSTR("PA Power\t = %s\r\n"),rf24_pa_dbm_e_str_P[getPALevel()]);
+*/
+}
+
+
 int default_configuration(struct nrf24_chip *ts)
 {
 	msleep(5);
@@ -560,6 +713,12 @@ int default_configuration(struct nrf24_chip *ts)
   // spectrum.
   setChannel(76);
 
+  // Open pipes for communication
+  openWritingPipe(0x00a5b4c370);
+  openReadingPipe(ts, 1, 0x00a5b4c371);
+
+  printDetails();
+
   return 0;
 }
 
@@ -591,14 +750,6 @@ payload_size = 8;
 	/* Allocate the async SPI transfer buffer */
 	ts->spiBuf = kzalloc(sizeof(u8)*(BUFFER_SIZE), GFP_KERNEL);
 	ts->txbuf = kzalloc(sizeof(u8)*(FIFO_SIZE), GFP_KERNEL);
-#if 0
-	/* Reset the chip */
-	sc16is7x2_write(ts, REG_IOC, 0, IOC_SRESET);
-	/* Force RTS lines low to keep tranmitter OFF */
-	sc16is7x2_write(ts, UART_MCR, 0, UART_MCR_RTS);
-	sc16is7x2_write(ts, UART_MCR, 1, UART_MCR_RTS);
-
-#endif
 
 	/* Setup IRQ. Actually we have a low active IRQ, but we want
 	 * one shot behaviour */
@@ -618,6 +769,7 @@ payload_size = 8;
 
 
 	dev_info(&spi->dev, TYPE_NAME " status %x\n",get_status(ts));
+printk(" ts pointer %x\n",(int)ts);
 #if 1
 	/* If we can allocate a minor number, hook up this device.
 	 * Reusing minors is fine so long as udev or mdev is working.
@@ -627,7 +779,7 @@ payload_size = 8;
 	if (minor < N_SPI_MINORS) {
 #endif
 		struct device *dev;
-		int minor = 1;
+		int minor = 2;
 
 		ts->devt = MKDEV(SPIDEV_MAJOR, minor);
 		dev = device_create(nrf24_class, &spi->dev, ts->devt,
@@ -659,19 +811,39 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 
 	if (ts == NULL)
 		return -ENODEV;
+	printk("ts %x\n",(int)ts);
+
+	if (ts->spi == NULL)
+		return -ENODEV;
+	printk("ts->spi %x\n",(int)ts->spi);
+
+	printk("ts->spi->irq %x\n",(int)ts->spi->irq);
+
+	if (&ts->lock == NULL)
+		return -ENODEV;
+	printk("ts->lock %x\n",(int)&ts->lock);
+
+	if (nrf24_class == NULL)
+		return -ENODEV;
+	printk("nrf24_class %x\n",(int)nrf24_class);
+
+	printk("ts->devt %x\n",(int)ts->devt);
+
+	/* Free the interrupt */
+	free_irq(ts->spi->irq, ts);
 
 	/* make sure ops on existing fds can abort cleanly */
+
 	spin_lock_irq(&ts->lock);
 	ts->spi = NULL;
 	spi_set_drvdata(spi, NULL);
 	spin_unlock_irq(&ts->lock);
 
-	/* Free the interrupt */
-	free_irq(ts->spi->irq, ts);
-
 	/* prevent new opens */
+
 	device_destroy(nrf24_class, ts->devt);
-	clear_bit(MINOR(ts->devt), minors);
+
+//	clear_bit(MINOR(ts->devt), minors);
 
 
 	kfree(ts->transfers); /* Free the async SPI transfer structures */
@@ -697,7 +869,7 @@ static struct spi_driver nrf24_spi_driver = {
 static int __init nrf24_init(void)
 {
 	int status;
-	status = register_chrdev(SPIDEV_MAJOR, "nrf24", &nrf24_fops);
+	status = register_chrdev(SPIDEV_MAJOR, DRIVER_NAME, &nrf24_fops);
 	if (status < 0)
 		return status;
 	nrf24_class = class_create(THIS_MODULE, "nrf24dev");
@@ -717,7 +889,9 @@ static int __init nrf24_init(void)
 /* Driver exit function */
 static void __exit nrf24_exit(void)
 {
+	printk("driver name %s\n",nrf24_spi_driver.driver.name);
 	spi_unregister_driver(&nrf24_spi_driver);
+	printk("Exit  nrf24_class %x\n",(int)nrf24_class);
 	class_destroy(nrf24_class);
 	unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
 }
