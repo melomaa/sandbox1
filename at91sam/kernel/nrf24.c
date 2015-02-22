@@ -38,7 +38,9 @@
 
 #define _BV(x) (1<<(x))
 
-static DECLARE_BITMAP(minors, N_SPI_MINORS);
+void printDetails(void);
+
+//static DECLARE_BITMAP(minors, N_SPI_MINORS);
 
 struct nrf24_chip {
 	struct spi_device *spi;
@@ -113,7 +115,6 @@ uint8_t read_buffer_from_register(uint8_t reg, uint8_t* buf, uint8_t len)
   ts->txbuf[0] = (R_REGISTER | ( REGISTER_MASK & reg ));
   spi_write_then_read(ts->spi, ts->txbuf, 1, buf, len);
 
-  printk("\nRxBuf(%d) %x: %x %x\n", len, reg, buf[0], buf[1]);
   return len;
 }
 
@@ -132,7 +133,6 @@ uint8_t write_buffer_to_register(uint8_t reg, const uint8_t* buf, uint8_t len)
   struct nrf24_chip *ts = p_ts;
   ts->txbuf[0] = (W_REGISTER | ( REGISTER_MASK & reg ));
   memcpy(&ts->txbuf[1],buf,len);
-  printk("\nWriteBuf(%d)%x: %x%x%x%x\n",len,ts->txbuf[0],ts->txbuf[1],ts->txbuf[2],ts->txbuf[3],ts->txbuf[4]);
   status = nrf24_write(ts, len+1);
 
   return status;
@@ -254,7 +254,7 @@ void enableDynamicPayloads(void)
   dynamic_payloads_enabled = true;
 }
 
-void setAutoAck( uint8_t pipe, bool enable )
+void setAutoAckPipe( uint8_t pipe, bool enable )
 {
   if ( pipe <= 6 )
   {
@@ -441,28 +441,131 @@ void openReadingPipe(struct nrf24_chip *ts, uint8_t child, uint64_t address)
   }
 }
 
+void startListening(struct nrf24_chip *ts)
+{
+  write_register(CONFIG, read_register(CONFIG) | _BV(PWR_UP) | _BV(PRIM_RX));
+  write_register(STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+
+  // Restore the pipe0 adddress, if exists
+  if (ts->pipe0_reading_address)
+    write_buffer_to_register(RX_ADDR_P0, (uint8_t*)(&ts->pipe0_reading_address), 5);
+
+  // Flush buffers
+  flush_rx();
+  flush_tx();
+
+  // Go!
+  ce(HIGH);
+
+  // wait for the radio to come up (130us actually only needed)
+  //delayMicroseconds(130);
+}
+
+void setAutoAck(bool enable)
+{
+  if ( enable )
+    write_register(EN_AA, 0b111111);
+  else
+    write_register(EN_AA, 0);
+}
+
+rf24_crclength_e getCRCLength(void)
+{
+  rf24_crclength_e result = RF24_CRC_DISABLED;
+  uint8_t config = read_register(CONFIG) & ( _BV(CRCO) | _BV(EN_CRC)) ;
+
+  if ( config & _BV(EN_CRC ) )
+  {
+    if ( config & _BV(CRCO) )
+      result = RF24_CRC_16;
+    else
+      result = RF24_CRC_8;
+  }
+
+  return result;
+}
+
 /* ******************************** IRQ ********************************* */
+
+int nrf24_write_read(struct nrf24_chip *ts, u8 *txbuf, unsigned n_tx, u8 *spibuf, unsigned n_rx);
+
+#define RING_BUFFER_SIZE	256
+uint8_t readIndex=0, writeIndex=0;
+char ringBuf_rx[RING_BUFFER_SIZE];
+
+int copy_to_ring_buffer(char *buf, int len)
+{
+	uint8_t copylen, rblen;
+	rblen = (int)RING_BUFFER_SIZE - writeIndex;
+	copylen = min(len, (int)rblen);
+	memcpy(&ringBuf_rx[writeIndex], buf, copylen);
+	writeIndex += copylen;
+	copylen = (len-copylen);
+	if (copylen > 0) {
+		memcpy(&ringBuf_rx[writeIndex], buf, copylen);
+		writeIndex += copylen;
+	}
+	return 0;
+}
 
 void nrf24_callback(void *data)
 {
   struct nrf24_chip *ts = (struct nrf24_chip*)data;
-  int reg = ts->txbuf[0];
+  int reg = ts->spiBuf[0];
+  unsigned long flags;
+  static uint8_t chipStatus=0;
+
+  printk("Callback (%x): %x\n", reg, ts->spiBuf[1]);
+  //write_register(STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+  spin_lock_irqsave(&ts->lock, flags);
 
   switch (reg) 
   {
-    case STATUS:
-      break;
-  }  
+  case STATUS:
+	  chipStatus = ts->spiBuf[1];
+	  if (chipStatus & 0x40) {
+		  ts->txbuf[0] = R_RX_PAYLOAD;
+		  nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,payload_size);
+	  }
+	  else {
+		  ts->txbuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
+		  ts->txbuf[1] = 0x70;
+		  nrf24_write_read(ts,ts->txbuf,2,ts->spiBuf,1);
+	  }
+	  break;
+  case R_RX_PAYLOAD:
+	  copy_to_ring_buffer(ts->spiBuf,payload_size);
+	  if (chipStatus & 0x70) {
+		  ts->txbuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
+		  ts->txbuf[1] = 0x70;
+		  nrf24_write_read(ts,ts->txbuf,2,ts->spiBuf,1);
+	  }
+	  break;
+  default:
+	  if (ts->queue) {
+		  ts->queue = 0;
+		  ts->txbuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
+		  nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,1);
+	  }
+	  else {
+		  ts->pending = 0;
+		  ts->txbuf[0] = 0xFF;
+	  }
+	  break;
+  }
+
+  spin_unlock_irqrestore(&ts->lock, flags);
+
+  return;
 }
 
-int nrf24_write_read(struct nrf24_chip *ts, /*struct sc16is7x2_channel *chan,*/
+int nrf24_write_read(struct nrf24_chip *ts,
                 u8 *txbuf, unsigned n_tx,
                 u8 *spibuf, unsigned n_rx)
 {
         int                     status;
         struct spi_message      *message;
         struct spi_transfer     *x;
-//	struct sc16is7x2_chip *ts = chan->chip;
 	struct spi_device *spi = ts->spi;
 
 	/* Sanity check */
@@ -511,11 +614,38 @@ uint8_t get_status(struct nrf24_chip *ts)
   return read_register(STATUS);
 }
 
+int get_register_async(struct nrf24_chip *ts, uint8_t reg)
+{
+	ts->txbuf[0] = ( R_REGISTER | ( REGISTER_MASK & reg) );
+	nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,1);
+	return 0;
+}
+
+int get_status_async(struct nrf24_chip *ts)
+{
+	//ts->txbuf[0] = ( R_REGISTER | ( REGISTER_MASK & reg) );
+	ts->txbuf[0] = NOP;
+	nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,1);
+	return 0;
+}
+
 static irqreturn_t nrf24_irq(int irq, void *data)
 {
-  struct nrf24_chip *ts = data;
-  ts->txbuf[0] = ( STATUS );
-  nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,1);
+	struct nrf24_chip *ts = data;
+	unsigned long flags;
+
+	//printk("IRQ ");
+
+	spin_lock_irqsave(&ts->lock, flags);
+	if (ts->pending != 0) {
+		ts->queue = 1;
+	}
+	else {
+		ts->pending = 1;
+		get_register_async(ts,STATUS);
+//		get_status_async(ts);
+	}
+	spin_unlock_irqrestore(&ts->lock, flags);
 
   return IRQ_HANDLED;
 }
@@ -549,12 +679,18 @@ uint8_t RF24::read_payload(void* buf, uint8_t len)
 static int nrf24_open(struct inode *inode, struct file *filp)
 {
   // Flush buffers
-  flush_rx();
-  flush_tx();
+//  flush_rx();
+//  flush_tx();
 
   powerUp(); //Power up by default when open() is called
 
+  msleep(2);
   filp->private_data =p_ts;
+
+  startListening(p_ts);
+
+  msleep(1);
+  printDetails();
 
   return 0;
 }
@@ -563,7 +699,15 @@ static int nrf24_open(struct inode *inode, struct file *filp)
 static ssize_t
 nrf24dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
-	return 0;
+	size_t bytes=0;
+
+	if(readIndex != writeIndex) {
+		if(writeIndex > readIndex) {
+			bytes = min((int)count,((int)writeIndex-readIndex));
+			bytes = copy_to_user(buf,&ringBuf_rx[readIndex],bytes);
+		}
+	}
+	return bytes;
 }
 
 /* Write-only message with current device setup */
@@ -579,29 +723,58 @@ nrf24dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct nrf24_chip *ts;
 	struct spi_device	*spi;
+	int ret = -1, cnt = 10;
+	char buf[10];
 
-printk(" Command %d, pointer %x\n",cmd,(int)filp->private_data);
-#if 1
-
+	printk(" Command %d, pointer %x\n",cmd,(unsigned int)arg);
 
 	ts = filp->private_data;
 	spin_lock_irq(&ts->lock);
 	spi = spi_dev_get(ts->spi);
 	spin_unlock_irq(&ts->lock);
 
-	
-#endif
 
-	switch (cmd)
-	{
-	  case 63:
-		dev_info(&spi->dev, TYPE_NAME " Status %x\n",(unsigned int)get_status(ts));
-		
+	while(cnt && ts->pending) {
+		msleep(10);
+		cnt--;
 	}
 
+	if (cnt > 0)
+	{
+		switch (cmd)
+		{
+		case 'c':
+			dev_info(&spi->dev, TYPE_NAME " Flush buffers.\n");
+			write_register(STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+			// Flush buffers
+			flush_rx();
+			flush_tx();
+			ret = 0;
+			break;
+		case 's':
+			buf[0] = get_status(ts);
+			dev_info(&spi->dev, TYPE_NAME " Status %x\n",(unsigned int)buf[0]);
+			memcpy((char*)arg,buf,1);
+			ret = 1;
+			break;
+		default:
+			ret = 0;
+			break;
+		}
+	}
+	else {
+		printk("SPI Timeout\n");
+	}
+
+	return ret;
+}
+/*
+static int nrf24_release(struct inode *inode, struct file *filp)
+{
+	write_register(CONFIG,read_register(CONFIG) & ~(_BV(PWR_UP)));
 	return 0;
 }
-
+*/
 static const struct file_operations nrf24_fops = {
 	.owner =	THIS_MODULE,
 	/* REVISIT switch to aio primitives, so that userspace
@@ -613,7 +786,7 @@ static const struct file_operations nrf24_fops = {
 	.unlocked_ioctl = nrf24dev_ioctl,
 //	.compat_ioctl = spidev_compat_ioctl,
 	.open =		nrf24_open,
-//	.release =	spidev_release,
+//	.release =	nrf24_release,
 //	.llseek =	no_llseek,
 };
 
@@ -663,11 +836,13 @@ void printDetails(void)
   print_byte_register("CONFIG",CONFIG,1);
   print_byte_register("DYNPD/FEATURE",DYNPD,2);
 
+  printk("CRC Length\t = %x\r\n",getCRCLength());
+//  printk("PA Power\t = %x\r\n"),getPALevel());
 /*
   printf_P(PSTR("Data Rate\t = %s\r\n"),rf24_datarate_e_str_P[getDataRate()]);
   printf_P(PSTR("Model\t\t = %s\r\n"),rf24_model_e_str_P[isPVariant()]);
-  printf_P(PSTR("CRC Length\t = %s\r\n"),rf24_crclength_e_str_P[getCRCLength()]);
-  printf_P(PSTR("PA Power\t = %s\r\n"),rf24_pa_dbm_e_str_P[getPALevel()]);
+
+
 */
 }
 
@@ -708,16 +883,23 @@ int default_configuration(struct nrf24_chip *ts)
   // Notice reset and flush is the last thing we do
   write_register(STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
 
+// enable dynamic payloads
+	enableDynamicPayloads();
+
+	setAutoAck(1);
+
   // Set up default configuration.  Callers can always change it later.
   // This channel should be universally safe and not bleed over into adjacent
   // spectrum.
-  setChannel(76);
+  setChannel(0x6e);
 
   // Open pipes for communication
   openWritingPipe(0x00a5b4c370);
   openReadingPipe(ts, 1, 0x00a5b4c371);
+  openReadingPipe(ts, 2, 0x00a5b4c372);
+  openReadingPipe(ts, 3, 0x00a5b4c373);
 
-  printDetails();
+
 
   return 0;
 }
@@ -726,21 +908,25 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 {
 	struct nrf24_chip *ts;
 	struct nrf24_platform_data *pdata;
-//	int ret;
+	struct device *dev;
+	int minor = 2;
+	//	int ret;
 
 	/* Get platform data for  module */
 	pdata = spi->dev.platform_data;
 
 	ce_pin = 111; /* AT91_PIN_PD15 */
+
+	at91_set_gpio_output(ce_pin,0);
 	ce(LOW);
 
 	ts = kzalloc(sizeof(struct nrf24_chip), GFP_KERNEL);
 	if (!ts)
 		return -ENOMEM;
 
-/* TODO */
-p_ts = ts;
-payload_size = 8;
+	/* TODO */
+	p_ts = ts;
+	payload_size = 10;
 
 	spi_set_drvdata(spi, ts);
 	ts->spi = spi;
@@ -751,54 +937,53 @@ payload_size = 8;
 	ts->spiBuf = kzalloc(sizeof(u8)*(BUFFER_SIZE), GFP_KERNEL);
 	ts->txbuf = kzalloc(sizeof(u8)*(FIFO_SIZE), GFP_KERNEL);
 
+	ts->pending = 0;
+	ts->queue = 0;
+
+	default_configuration(ts);
+
+	/* If we can allocate a minor number, hook up this device.
+	 * Reusing minors is fine so long as udev or mdev is working.
+	 */
+
+	ts->devt = MKDEV(SPIDEV_MAJOR, minor);
+	dev = device_create(nrf24_class, &spi->dev, ts->devt,
+			ts, "radio%d",
+			spi->chip_select);
+	//		ret = IS_ERR(dev) ? PTR_ERR(dev) : 0;
+
 	/* Setup IRQ. Actually we have a low active IRQ, but we want
 	 * one shot behaviour */
-	if (request_irq(ts->spi->irq, nrf24_irq,
-			IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING | IRQF_SHARED,
-			"nrf24", ts)) {
-		dev_err(&ts->spi->dev, "IRQ request failed\n");
-//		destroy_workqueue(chan->workqueue);
-//		chan->workqueue = NULL;
-//		return -EBUSY;
-		goto exit_destroy;
+	int irq_num = 105;//gpio_to_irq(ts->spi->irq);
+	if (irq_num < 0) {
+		dev_err(&ts->spi->dev, "GPIO to IRQ failed\n");
 	}
+	else {
+		ts->spi->irq = irq_num;
+		if (request_any_context_irq(irq_num, nrf24_irq,
+				IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING | IRQF_SHARED,
+				"nrf24", ts)) {
+			dev_err(&ts->spi->dev, "IRQ request failed\n");
+			//		destroy_workqueue(chan->workqueue);
+			//		chan->workqueue = NULL;
+			//		return -EBUSY;
+			goto exit_destroy;
+		}
+	}
+
 
 
 	dev_info(&spi->dev, TYPE_NAME " at CS%d (irq %d), 2.4GHz radio link\n",
 			spi->chip_select, spi->irq);
 
 
-	dev_info(&spi->dev, TYPE_NAME " status %x\n",get_status(ts));
-printk(" ts pointer %x\n",(int)ts);
-#if 1
-	/* If we can allocate a minor number, hook up this device.
-	 * Reusing minors is fine so long as udev or mdev is working.
-	 */
-#if 0 //MULTICHANNEL
-	minor = find_first_zero_bit(minors, N_SPI_MINORS);
-	if (minor < N_SPI_MINORS) {
-#endif
-		struct device *dev;
-		int minor = 2;
+	dev_info(&spi->dev, TYPE_NAME " IRQ handler %x\n",(int)nrf24_irq);
+	printk(" ts pointer %x\n",(int)ts);
 
-		ts->devt = MKDEV(SPIDEV_MAJOR, minor);
-		dev = device_create(nrf24_class, &spi->dev, ts->devt,
-				    ts, "radio%d",
-				    spi->chip_select);
-//		ret = IS_ERR(dev) ? PTR_ERR(dev) : 0;
-#if 0 //MULTICHANNEL
-	} else {
-		dev_dbg(&spi->dev, "no minor number available!\n");
-		status = -ENODEV;
-	}
-#endif
-
-#endif
-	default_configuration(ts);
 
 	return 0;
 
-exit_destroy:
+	exit_destroy:
 	dev_set_drvdata(&spi->dev, NULL);
 	kfree(ts);
 	return 0;
