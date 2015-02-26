@@ -1,6 +1,12 @@
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/workqueue.h>
+#include <linux/tty.h>
+#include <linux/tty_flip.h>
+#include <linux/serial_reg.h>
+#include <linux/serial_core.h>
+#include <linux/serial.h>
 #include <linux/gpio.h>
 #include <linux/spi/spi.h>
 #include <linux/interrupt.h>
@@ -23,10 +29,10 @@
 #define DRIVER_NAME		"nrf24_spi"
 #define TYPE_NAME		"2.4GHz_radio"
 
-#define FIFO_SIZE		64
+#define FIFO_SIZE		32
 #define USLEEP_DELTA		500
 #define SPI_MAX_TRANSFERS	8
-#define BUFFER_SIZE		(FIFO_SIZE+4)
+#define BUFFER_SIZE		(FIFO_SIZE*4)
 
 
 #define SPIDEV_MAJOR                    153     /* assigned */
@@ -44,6 +50,7 @@ void printDetails(void);
 
 struct nrf24_chip {
 	struct spi_device *spi;
+	struct uart_port	uart;
 	dev_t                   devt;
 //	struct nrf24_channel channel[6];
 	spinlock_t              lock;
@@ -59,7 +66,9 @@ struct nrf24_chip {
 };
 
 struct nrf24_platform_data {
-	u8	dummy;
+	unsigned int	uartclk;
+	/* uart line number of the first channel */
+	unsigned	uart_base;
 };
 
   uint8_t ce_pin; /**< "Chip Enable" pin, activates the RX or TX role */
@@ -73,6 +82,7 @@ struct nrf24_platform_data {
 //  uint64_t pipe0_reading_address; /**< Last address set on pipe 0 for reading. */
 
 static struct nrf24_chip *p_ts;
+static unsigned int mcr = 0;
 
 /* ******************************** SPI ********************************* */
 
@@ -199,6 +209,11 @@ uint8_t flush_tx(void)
 void powerUp(void)
 {
   write_register(CONFIG,read_register(CONFIG) | _BV(PWR_UP));
+}
+
+void powerDown(void)
+{
+	write_register(CONFIG,read_register(CONFIG) & ~(_BV(PWR_UP)));
 }
 
 void toggle_features(void)
@@ -508,6 +523,45 @@ int copy_to_ring_buffer(char *buf, int len)
 	return 0;
 }
 
+static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
+{
+	struct uart_port *uart = &ts->uart;
+	struct tty_struct *tty = uart->state->port.tty;
+	unsigned long flags;
+
+	/* Check that transfer was successful */
+	if (ts->message.status != 0) {
+		printk(KERN_ERR "Message returned %d\n",ts->message.status);
+		return;
+	}
+	printk("Rx %d\n",rxlvl);
+
+	/* Check the amount of received data */
+	if (rxlvl <= 0) {
+		return;
+	} else if (rxlvl > FIFO_SIZE) {
+		/* Ensure sanity of RX level */
+		rxlvl = FIFO_SIZE;
+	}
+
+	ts->spiBuf[rxlvl + 1] = '\0';
+
+	spin_lock_irqsave(&uart->lock, flags);
+	/* Insert received data */
+	tty_insert_flip_string(tty, &ts->spiBuf[1], rxlvl);
+	/* Update RX counter */
+	uart->icount.rx += rxlvl;
+
+	spin_unlock_irqrestore(&uart->lock, flags);
+
+//	return;
+
+	/* Push the received data to receivers */
+	if (rxlvl)
+		tty_flip_buffer_push(tty);
+
+}
+
 void nrf24_callback(void *data)
 {
   struct nrf24_chip *ts = (struct nrf24_chip*)data;
@@ -515,7 +569,7 @@ void nrf24_callback(void *data)
   unsigned long flags;
   static uint8_t chipStatus=0;
 
-  printk("Callback (%x): %x\n", reg, ts->spiBuf[1]);
+  //printk("Callback (%x): %x\n", reg, ts->spiBuf[1]);
   //write_register(STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
   spin_lock_irqsave(&ts->lock, flags);
 
@@ -524,6 +578,7 @@ void nrf24_callback(void *data)
   case STATUS:
 	  chipStatus = ts->spiBuf[1];
 	  if (chipStatus & 0x40) {
+		  printk("S: %x\n", chipStatus);
 		  ts->txbuf[0] = R_RX_PAYLOAD;
 		  nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,payload_size);
 	  }
@@ -534,7 +589,8 @@ void nrf24_callback(void *data)
 	  }
 	  break;
   case R_RX_PAYLOAD:
-	  copy_to_ring_buffer(ts->spiBuf,payload_size);
+	  async_handle_rx(ts,payload_size);
+//	  copy_to_ring_buffer(ts->spiBuf,payload_size);
 	  if (chipStatus & 0x70) {
 		  ts->txbuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
 		  ts->txbuf[1] = 0x70;
@@ -675,19 +731,27 @@ uint8_t RF24::read_payload(void* buf, uint8_t len)
 
 /* ******************************** FOPS ********************************* */
 
+#define to_nrf24_struct(port) \
+		container_of(port, struct nrf24_chip, uart)
 
-static int nrf24_open(struct inode *inode, struct file *filp)
+//static int nrf24_open(struct inode *inode, struct file *filp)
+static int nrf24_open(struct uart_port *port)
 {
-  // Flush buffers
+	struct nrf24_chip *ts = to_nrf24_struct(port);
+
+	printk("Port: %x, ts: %x\n",(int)port,(int)ts);
+	// Flush buffers
 //  flush_rx();
 //  flush_tx();
 
+	if (ts == NULL)
+		return -1;
   powerUp(); //Power up by default when open() is called
 
   msleep(2);
-  filp->private_data =p_ts;
+//  filp->private_data =p_ts;
 
-  startListening(p_ts);
+  startListening(ts);
 
   msleep(1);
   printDetails();
@@ -718,8 +782,8 @@ nrf24dev_write(struct file *filp, const char __user *buf,
 	return 0;
 }
 
-static long
-nrf24dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+//static long nrf24dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned long arg)
 {
 	struct nrf24_chip *ts;
 	struct spi_device	*spi;
@@ -728,7 +792,11 @@ nrf24dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 	printk(" Command %d, pointer %x\n",cmd,(unsigned int)arg);
 
-	ts = filp->private_data;
+//	ts = filp->private_data;
+	ts = to_nrf24_struct(port);
+	if (ts == NULL)
+		return ret;
+
 	spin_lock_irq(&ts->lock);
 	spi = spi_dev_get(ts->spi);
 	spin_unlock_irq(&ts->lock);
@@ -757,8 +825,16 @@ nrf24dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			memcpy((char*)arg,buf,1);
 			ret = 1;
 			break;
-		default:
+#if 0
+		case TCGETS:
 			ret = 0;
+			break;
+		case TCSETSW:
+			ret = 0;
+			break;
+#endif
+		default:
+			ret = -ENOIOCTLCMD;;
 			break;
 		}
 	}
@@ -775,6 +851,7 @@ static int nrf24_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 */
+#if 0
 static const struct file_operations nrf24_fops = {
 	.owner =	THIS_MODULE,
 	/* REVISIT switch to aio primitives, so that userspace
@@ -791,6 +868,7 @@ static const struct file_operations nrf24_fops = {
 };
 
 static struct class *nrf24_class;
+#endif
 
 /* ******************************** INIT ********************************* */
 void print_byte_register(const char* name, uint8_t reg, uint8_t qty)
@@ -904,16 +982,171 @@ int default_configuration(struct nrf24_chip *ts)
   return 0;
 }
 
+
+static const char * nrf24_type(struct uart_port *port)
+{
+	printk("%s\n", __func__);
+	return TYPE_NAME;
+}
+
+static void nrf24_release_port(struct uart_port *port)
+{
+	printk("%s\n", __func__);
+}
+
+static int nrf24_request_port(struct uart_port *port)
+{
+	printk("%s\n", __func__);
+	return 0;
+}
+
+static void nrf24_config_port(struct uart_port *port, int flags)
+{
+	printk("%s\n", __func__);
+	return;
+}
+
+static int
+nrf24_verify_port(struct uart_port *port, struct serial_struct *ser)
+{
+	if (ser->type == PORT_UNKNOWN || ser->type == 98)
+		return 0;
+
+	return -EINVAL;
+}
+
+static void nrf24_shutdown(struct uart_port *port)
+{
+	printk("%s\n", __func__);
+	return;
+}
+
+static unsigned int nrf24_tx_empty(struct uart_port *port)
+{
+	printk("%s\n", __func__);
+	return 1;
+}
+
+static unsigned int nrf24_get_mctrl(struct uart_port *port)
+{
+	printk("%s\n", __func__);
+	return mcr;
+}
+
+static void nrf24_set_mctrl(struct uart_port *port, unsigned int mctrl)
+{
+	printk("%s\n", __func__);
+	mcr = mctrl;
+}
+
+
+static void nrf24_stop_tx(struct uart_port *port)
+{
+	/* Do nothing */
+}
+
+static void nrf24_start_tx(struct uart_port *port)
+{
+	struct nrf24_chip *ts;
+
+	ts = to_nrf24_struct(port);
+	if (ts == NULL)
+			return;
+
+	dev_dbg(&ts->spi->dev, "%s\n", __func__);
+
+	/* Trigger work thread for sending data */
+	//nrf24_dowork(chan);
+}
+
+static void nrf24_stop_rx(struct uart_port *port)
+{
+	struct nrf24_chip *ts;
+
+	ts = to_nrf24_struct(port);
+	if (ts == NULL)
+			return;
+
+	dev_dbg(&ts->spi->dev, "%s\n", __func__);
+
+	ce(LOW);
+	powerDown();
+	/* Trigger work thread for doing the actual configuration change */
+	//nrf24_dowork(chan);
+}
+
+static void
+nrf24_set_termios(struct uart_port *port, struct ktermios *termios,
+		       struct ktermios *old)
+{
+	printk("%s\n", __func__);
+	return;
+}
+static struct uart_ops nrf24_uart_ops = {
+	.tx_empty	= nrf24_tx_empty,
+	.set_mctrl	= nrf24_set_mctrl,
+	.get_mctrl	= nrf24_get_mctrl,
+	.stop_tx        = nrf24_stop_tx,
+	.start_tx	= nrf24_start_tx,
+	.stop_rx	= nrf24_stop_rx,
+/*	.enable_ms      = sc16is7x2_enable_ms,
+	.break_ctl      = sc16is7x2_break_ctl,
+	*/
+	.startup	= nrf24_open,
+	.shutdown	= nrf24_shutdown,
+	.set_termios	= nrf24_set_termios,
+
+	.type		= nrf24_type,
+	.release_port   = nrf24_release_port,
+	.request_port   = nrf24_request_port,
+	.config_port	= nrf24_config_port,
+	.verify_port	= nrf24_verify_port,
+	.ioctl		= nrf24dev_ioctl,
+};
+
+static struct uart_driver nrf24_uart_driver = {
+	.owner          = THIS_MODULE,
+	.driver_name    = DRIVER_NAME,
+	.dev_name       = "ttyRF",
+	.nr             = 1,
+};
+
+static int nrf24_register_uart_port(struct nrf24_chip *ts,
+		struct nrf24_platform_data *pdata, int ch)
+{
+	struct uart_port *uart = &ts->uart;
+
+	/* Disable irqs and go to sleep */
+//	sc16is7x2_write(ts, UART_IER, ch, UART_IERX_SLEEP);
+
+//	chan->chip = ts;
+
+	uart->irq = ts->spi->irq;
+	uart->uartclk = pdata->uartclk;
+	uart->fifosize = FIFO_SIZE;
+	uart->ops = &nrf24_uart_ops;
+	uart->flags = UPF_SKIP_TEST | UPF_BOOT_AUTOCONF;
+	uart->line = pdata->uart_base + ch;
+	uart->type = 98; //PORT_16650;
+	uart->dev = &ts->spi->dev;
+
+	return uart_add_one_port(&nrf24_uart_driver, uart);
+}
+
 static int __devinit nrf24_probe(struct spi_device *spi)
 {
 	struct nrf24_chip *ts;
-	struct nrf24_platform_data *pdata;
+	struct nrf24_platform_data platdata;
+	struct nrf24_platform_data *pdata = &platdata;
 	struct device *dev;
 	int minor = 2;
-	//	int ret;
+	int ret;
 
 	/* Get platform data for  module */
-	pdata = spi->dev.platform_data;
+//	pdata = spi->dev.platform_data;
+
+	pdata->uartclk = 16000000;
+	pdata->uart_base = 0;
 
 	ce_pin = 111; /* AT91_PIN_PD15 */
 
@@ -941,7 +1174,7 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 	ts->queue = 0;
 
 	default_configuration(ts);
-
+#if 0
 	/* If we can allocate a minor number, hook up this device.
 	 * Reusing minors is fine so long as udev or mdev is working.
 	 */
@@ -951,6 +1184,10 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 			ts, "radio%d",
 			spi->chip_select);
 	//		ret = IS_ERR(dev) ? PTR_ERR(dev) : 0;
+#endif
+	ret = nrf24_register_uart_port(ts, pdata, 0);
+	if (ret)
+		goto exit_destroy;
 
 	/* Setup IRQ. Actually we have a low active IRQ, but we want
 	 * one shot behaviour */
@@ -967,7 +1204,7 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 			//		destroy_workqueue(chan->workqueue);
 			//		chan->workqueue = NULL;
 			//		return -EBUSY;
-			goto exit_destroy;
+			goto exit_uart0;
 		}
 	}
 
@@ -983,7 +1220,9 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 
 	return 0;
 
-	exit_destroy:
+exit_uart0:
+	uart_remove_one_port(&nrf24_uart_driver, &ts->uart);
+exit_destroy:
 	dev_set_drvdata(&spi->dev, NULL);
 	kfree(ts);
 	return 0;
@@ -992,7 +1231,7 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 static int __devexit nrf24_remove(struct spi_device *spi)
 {
 	struct nrf24_chip *ts = spi_get_drvdata(spi);
-//	int ret;
+	int ret;
 
 	if (ts == NULL)
 		return -ENODEV;
@@ -1007,27 +1246,33 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 	if (&ts->lock == NULL)
 		return -ENODEV;
 	printk("ts->lock %x\n",(int)&ts->lock);
-
+#if 0
 	if (nrf24_class == NULL)
 		return -ENODEV;
 	printk("nrf24_class %x\n",(int)nrf24_class);
 
 	printk("ts->devt %x\n",(int)ts->devt);
-
+#endif
 	/* Free the interrupt */
 	free_irq(ts->spi->irq, ts);
 
-	/* make sure ops on existing fds can abort cleanly */
 
+
+
+	ret = uart_remove_one_port(&nrf24_uart_driver, &ts->uart);
+	if (ret)
+		return ret;
+
+	/* make sure ops on existing fds can abort cleanly */
 	spin_lock_irq(&ts->lock);
 	ts->spi = NULL;
 	spi_set_drvdata(spi, NULL);
 	spin_unlock_irq(&ts->lock);
 
 	/* prevent new opens */
-
+#if 0
 	device_destroy(nrf24_class, ts->devt);
-
+#endif
 //	clear_bit(MINOR(ts->devt), minors);
 
 
@@ -1054,6 +1299,7 @@ static struct spi_driver nrf24_spi_driver = {
 static int __init nrf24_init(void)
 {
 	int status;
+#if 0
 	status = register_chrdev(SPIDEV_MAJOR, DRIVER_NAME, &nrf24_fops);
 	if (status < 0)
 		return status;
@@ -1062,12 +1308,19 @@ static int __init nrf24_init(void)
 		unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
 		return PTR_ERR(nrf24_class);
 	}
+#endif
+	int ret = uart_register_driver(&nrf24_uart_driver);
+		if (ret)
+			return ret;
 
 	status = spi_register_driver(&nrf24_spi_driver);
+#if 0
 	if (status < 0) {
+
 		class_destroy(nrf24_class);
 		unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
 	}
+#endif
 	return status;
 }
 
@@ -1076,9 +1329,12 @@ static void __exit nrf24_exit(void)
 {
 	printk("driver name %s\n",nrf24_spi_driver.driver.name);
 	spi_unregister_driver(&nrf24_spi_driver);
+	uart_unregister_driver(&nrf24_uart_driver);
+#if 0
 	printk("Exit  nrf24_class %x\n",(int)nrf24_class);
 	class_destroy(nrf24_class);
 	unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
+#endif
 }
 
 /* register after spi postcore initcall and before
