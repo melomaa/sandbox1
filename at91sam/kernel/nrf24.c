@@ -2,6 +2,7 @@
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/workqueue.h>
+#include <linux/freezer.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
 #include <linux/serial_reg.h>
@@ -21,7 +22,8 @@
 #include <linux/errno.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
-#include <asm/uaccess.h>
+//#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 
 #include "nrf24.h"
 #include "nRF24L01.h"
@@ -41,12 +43,18 @@
 #define LOW	0
 #define HIGH	1
 
+#define TIO_NRF24_ACKPAYLOAD	0xF240
 
 #define _BV(x) (1<<(x))
 
 void printDetails(void);
 
 //static DECLARE_BITMAP(minors, N_SPI_MINORS);
+struct nrf24_ioctl {
+	int pipe;
+	char ackPayload[32];
+	int apLen;
+};
 
 struct nrf24_chip {
 	struct spi_device *spi;
@@ -63,6 +71,10 @@ struct nrf24_chip {
 	u8		*txbuf;
 	bool		p_variant;
 	uint64_t	pipe0_reading_address;
+	struct nrf24_ioctl nioctl;
+	bool	ackPayload;
+	struct workqueue_struct *workqueue;
+	struct work_struct	work;
 };
 
 struct nrf24_platform_data {
@@ -71,8 +83,9 @@ struct nrf24_platform_data {
 	unsigned	uart_base;
 };
 
+
+
   uint8_t ce_pin; /**< "Chip Enable" pin, activates the RX or TX role */
-//  uint8_t csn_pin; /**< SPI Chip select */
   bool wide_band; /* 2Mbs data rate in use? */
 //  bool p_variant; /* False for RF24L01 and true for RF24L01P */
   uint8_t payload_size; /**< Fixed size of payloads */
@@ -80,7 +93,7 @@ struct nrf24_platform_data {
   bool dynamic_payloads_enabled; /**< Whether dynamic payloads are enabled. */ 
 //  uint8_t ack_payload_length; /**< Dynamic size of pending ack payload. */
 //  uint64_t pipe0_reading_address; /**< Last address set on pipe 0 for reading. */
-
+  static const uint8_t max_payload_size = 32;
 static struct nrf24_chip *p_ts;
 static unsigned int mcr = 0;
 
@@ -116,14 +129,15 @@ void ce(int level)
 uint8_t read_buffer_from_register(uint8_t reg, uint8_t* buf, uint8_t len)
 {
   struct nrf24_chip *ts = p_ts;
+  unsigned char localBuf[max_payload_size];
  // uint8_t* first = buf;
 /*  int status = nrf24_read(ts,reg);
 
   while ( len-- )
     *buf++ = spi_w8r8(ts->spi,0xff);
 */
-  ts->txbuf[0] = (R_REGISTER | ( REGISTER_MASK & reg ));
-  spi_write_then_read(ts->spi, ts->txbuf, 1, buf, len);
+  localBuf[0] = (R_REGISTER | ( REGISTER_MASK & reg ));
+  spi_write_then_read(ts->spi, localBuf, 1, buf, len);
 
   return len;
 }
@@ -141,6 +155,7 @@ uint8_t write_buffer_to_register(uint8_t reg, const uint8_t* buf, uint8_t len)
 {
   uint8_t status;
   struct nrf24_chip *ts = p_ts;
+
   ts->txbuf[0] = (W_REGISTER | ( REGISTER_MASK & reg ));
   memcpy(&ts->txbuf[1],buf,len);
   status = nrf24_write(ts, len+1);
@@ -182,7 +197,20 @@ uint8_t write_payload(const void* buf, uint8_t len)
   return status;
 }
 
+void writeAckPayload(struct nrf24_chip *ts, uint8_t pipe, const void* buf, uint8_t len)
+{
+  int status;
+  uint8_t data_len = min(len,max_payload_size);
 
+//  printk("ts: %x, txb: %x, buf: %x, len: %d\n",(unsigned int)ts, (unsigned int)&ts->txbuf[0],(unsigned int)buf, data_len);
+  printk("nio: %x, app: %x, pl: %x\n",(unsigned int)&ts->nioctl, (unsigned int)&ts->nioctl.ackPayload, *(unsigned int*)ts->nioctl.ackPayload);
+  #if 1
+  ts->txbuf[0] = ( W_ACK_PAYLOAD | ( pipe & 0b111 ) );
+  memcpy(&ts->txbuf[1],buf,data_len);
+  status = nrf24_write(ts, data_len+1);
+#endif
+  return;
+}
 
 /* ******************************** CONFIG ********************************* */
 
@@ -504,6 +532,7 @@ rf24_crclength_e getCRCLength(void)
 
 int nrf24_write_read(struct nrf24_chip *ts, u8 *txbuf, unsigned n_tx, u8 *spibuf, unsigned n_rx);
 
+#if 0
 #define RING_BUFFER_SIZE	256
 uint8_t readIndex=0, writeIndex=0;
 char ringBuf_rx[RING_BUFFER_SIZE];
@@ -522,6 +551,30 @@ int copy_to_ring_buffer(char *buf, int len)
 	}
 	return 0;
 }
+#endif
+
+static void nrf24_set_ackpayload(struct nrf24_chip *ts)
+{
+	if (ts->ackPayload) {
+		writeAckPayload(ts, ts->nioctl.pipe, (const void*)ts->nioctl.ackPayload, ts->nioctl.apLen);
+		ts->ackPayload = false;
+	}
+}
+
+
+static void nrf24_work_routine(struct work_struct *w)
+{
+	struct nrf24_chip *ts = container_of(w, struct nrf24_chip, work);
+
+	nrf24_set_ackpayload(ts);
+}
+
+/* Trigger work thread*/
+static void nrf24_dowork(struct nrf24_chip *ts)
+{
+	if (!freezing(current))
+		queue_work(ts->workqueue, &ts->work);
+}
 
 static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 {
@@ -534,7 +587,6 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 		printk(KERN_ERR "Message returned %d\n",ts->message.status);
 		return;
 	}
-	printk("Rx %d\n",rxlvl);
 
 	/* Check the amount of received data */
 	if (rxlvl <= 0) {
@@ -554,7 +606,7 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 
 	spin_unlock_irqrestore(&uart->lock, flags);
 
-//	return;
+	printk("Rx(%d) %x %x %x\n",rxlvl,ts->spiBuf[1],ts->spiBuf[2],ts->spiBuf[3]);
 
 	/* Push the received data to receivers */
 	if (rxlvl)
@@ -568,6 +620,7 @@ void nrf24_callback(void *data)
   int reg = ts->spiBuf[0];
   unsigned long flags;
   static uint8_t chipStatus=0;
+  unsigned char localBuf[max_payload_size];
 
   //printk("Callback (%x): %x\n", reg, ts->spiBuf[1]);
   //write_register(STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
@@ -578,34 +631,39 @@ void nrf24_callback(void *data)
   case STATUS:
 	  chipStatus = ts->spiBuf[1];
 	  if (chipStatus & 0x40) {
-		  printk("S: %x\n", chipStatus);
-		  ts->txbuf[0] = R_RX_PAYLOAD;
-		  nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,payload_size);
+		  //printk("S: %x\n", chipStatus);
+		  localBuf[0] = R_RX_PAYLOAD;
+		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,payload_size);
 	  }
 	  else {
-		  ts->txbuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
-		  ts->txbuf[1] = 0x70;
-		  nrf24_write_read(ts,ts->txbuf,2,ts->spiBuf,1);
+		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
+		  localBuf[1] = 0x70;
+		  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
 	  }
 	  break;
   case R_RX_PAYLOAD:
 	  async_handle_rx(ts,payload_size);
 //	  copy_to_ring_buffer(ts->spiBuf,payload_size);
 	  if (chipStatus & 0x70) {
-		  ts->txbuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
-		  ts->txbuf[1] = 0x70;
-		  nrf24_write_read(ts,ts->txbuf,2,ts->spiBuf,1);
+		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
+		  localBuf[1] = 0x70;
+		  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
 	  }
 	  break;
   default:
 	  if (ts->queue) {
 		  ts->queue = 0;
-		  ts->txbuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
-		  nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,1);
+		  localBuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
+		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
 	  }
+#if 0
+	  else if (ts->todo) {
+		  nrf24_dowork(ts);
+		  ts->todo = false;
+	  }
+#endif
 	  else {
 		  ts->pending = 0;
-		  ts->txbuf[0] = 0xFF;
 	  }
 	  break;
   }
@@ -672,16 +730,17 @@ uint8_t get_status(struct nrf24_chip *ts)
 
 int get_register_async(struct nrf24_chip *ts, uint8_t reg)
 {
-	ts->txbuf[0] = ( R_REGISTER | ( REGISTER_MASK & reg) );
-	nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,1);
+	unsigned char localBuf[max_payload_size];
+	localBuf[0] = ( R_REGISTER | ( REGISTER_MASK & reg) );
+	nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
 	return 0;
 }
 
 int get_status_async(struct nrf24_chip *ts)
 {
-	//ts->txbuf[0] = ( R_REGISTER | ( REGISTER_MASK & reg) );
-	ts->txbuf[0] = NOP;
-	nrf24_write_read(ts,ts->txbuf,1,ts->spiBuf,1);
+	unsigned char localBuf[max_payload_size];
+	localBuf[0] = NOP;
+	nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
 	return 0;
 }
 
@@ -729,6 +788,7 @@ uint8_t RF24::read_payload(void* buf, uint8_t len)
 }
 */
 
+
 /* ******************************** FOPS ********************************* */
 
 #define to_nrf24_struct(port) \
@@ -748,6 +808,15 @@ static int nrf24_open(struct uart_port *port)
 		return -1;
   powerUp(); //Power up by default when open() is called
 
+  ts->ackPayload = false;
+	/* Initialize work queue */
+	ts->workqueue = create_freezable_workqueue("nrf24");
+	if (!ts->workqueue) {
+		dev_err(&ts->spi->dev, "Workqueue creation failed\n");
+		return -EBUSY;
+	}
+	INIT_WORK(&ts->work, nrf24_work_routine);
+
   msleep(2);
 //  filp->private_data =p_ts;
 
@@ -758,7 +827,7 @@ static int nrf24_open(struct uart_port *port)
 
   return 0;
 }
-
+#if 0
 /* Read-only message with current device setup */
 static ssize_t
 nrf24dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
@@ -781,7 +850,7 @@ nrf24dev_write(struct file *filp, const char __user *buf,
 {
 	return 0;
 }
-
+#endif
 //static long nrf24dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned long arg)
 {
@@ -824,6 +893,12 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 			dev_info(&spi->dev, TYPE_NAME " Status %x\n",(unsigned int)buf[0]);
 			memcpy((char*)arg,buf,1);
 			ret = 1;
+		case TIO_NRF24_ACKPAYLOAD:
+			memcpy(&ts->nioctl, (void*)arg, sizeof(struct nrf24_ioctl));
+			printk("AP(%d): %d (%d)\n",ts->nioctl.pipe,(unsigned int)ts->nioctl.ackPayload,ts->nioctl.apLen);
+			ts->ackPayload = true;
+			nrf24_dowork(ts);
+			ret = 0;
 			break;
 #if 0
 		case TCGETS:
@@ -965,7 +1040,7 @@ int default_configuration(struct nrf24_chip *ts)
 	enableDynamicPayloads();
 
 	setAutoAck(1);
-
+	enableAckPayload();
   // Set up default configuration.  Callers can always change it later.
   // This channel should be universally safe and not bleed over into adjacent
   // spectrum.
@@ -1017,7 +1092,18 @@ nrf24_verify_port(struct uart_port *port, struct serial_struct *ser)
 
 static void nrf24_shutdown(struct uart_port *port)
 {
+	struct nrf24_chip *ts;
+
 	printk("%s\n", __func__);
+
+	ts = to_nrf24_struct(port);
+	BUG_ON(!ts);
+	if (ts->workqueue) {
+		/* Flush and destroy work queue */
+		flush_workqueue(ts->workqueue);
+		destroy_workqueue(ts->workqueue);
+		ts->workqueue = NULL;
+	}
 	return;
 }
 
@@ -1079,9 +1165,20 @@ static void
 nrf24_set_termios(struct uart_port *port, struct ktermios *termios,
 		       struct ktermios *old)
 {
+	struct nrf24_chip *ts;
+	unsigned long flags;
+
 	printk("%s\n", __func__);
+	ts = to_nrf24_struct(port);
+	spin_lock_irqsave(&ts->uart.lock, flags);
+	/* we are sending char from a workqueue so enable */
+	ts->uart.state->port.tty->low_latency = 1;
+	/* Update the per-port timeout. */
+	uart_update_timeout(port, termios->c_cflag, 57600);
+	spin_unlock_irqrestore(&ts->uart.lock, flags);
 	return;
 }
+
 static struct uart_ops nrf24_uart_ops = {
 	.tx_empty	= nrf24_tx_empty,
 	.set_mctrl	= nrf24_set_mctrl,
