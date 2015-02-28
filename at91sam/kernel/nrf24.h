@@ -2,6 +2,27 @@
 #ifndef __LINUX_NRF24_H
 #define __LINUX_NRF24_H
 
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/device.h>
+#include <linux/tty.h>
+#include <linux/types.h>
+#include <linux/serial_reg.h>
+#include <linux/serial_core.h>
+#include <linux/serial.h>
+#include <linux/spi/spi.h>
+
+#include "nRF24L01.h"
+
+#define MAX_PAYLOAD_SIZE	32
+
+#define LOW		0
+#define HIGH	1
+
+#define TIO_NRF24_ACKPAYLOAD	0xF240
+
+#define _BV(x) (1<<(x))
+
 /**
  * Power Amplifier level.
  *
@@ -23,9 +44,52 @@ typedef enum { RF24_1MBPS = 0, RF24_2MBPS, RF24_250KBPS } rf24_datarate_e;
  */
 typedef enum { RF24_CRC_DISABLED = 0, RF24_CRC_8, RF24_CRC_16 } rf24_crclength_e;
 
+struct nrf24_ioctl {
+	int pipe;
+	char ackPayload[32];
+	int apLen;
+};
+
+struct nrf24_chip {
+	struct spi_device *spi;
+	struct uart_port	uart;
+	dev_t                   devt;
+//	struct nrf24_channel channel[6];
+	spinlock_t              lock;
+	u8		pending;	/* Async transfer active (only one at a time)*/
+	u8		state;		/* Which state (async spi) is being handled */
+	u8 		queue;		/* Queued interrupt */
+        struct spi_message      message; /* Message struct for async transfer */
+        struct spi_transfer     *transfers; /* Transfer structs for the async message */
+	u8 		*spiBuf;	/* Buffer for message data */
+	u8		*txbuf;
+	struct mutex txlock;
+	bool		p_variant;
+	uint64_t	pipe0_reading_address;
+	struct nrf24_ioctl nioctl;
+	bool	ackPayload;
+	struct workqueue_struct *workqueue;
+	struct work_struct	work;
+	  uint8_t payload_size; /**< Fixed size of payloads */
+	  bool dynamic_payloads_enabled; /**< Whether dynamic payloads are enabled. */
+	  bool wide_band; /* 2Mbs data rate in use? */
+};
+
+struct nrf24_platform_data {
+	unsigned int	uartclk;
+	/* uart line number of the first channel */
+	unsigned	uart_base;
+};
+
 typedef struct nrf24_configuration {
 	int payload;
 	
 }nrf24_config_t;
+
+void ce(int level);
+int nrf24_write_from_buf(struct nrf24_chip *ts, u8 *buf, u8 len);
+uint8_t write_register(struct nrf24_chip *ts, uint8_t reg, uint8_t val);
+uint8_t write_buffer_to_register(struct nrf24_chip *ts, uint8_t reg, const uint8_t* data, uint8_t len);
+uint8_t read_register(struct nrf24_chip *ts, uint8_t reg);
 
 #endif

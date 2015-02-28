@@ -1,0 +1,2 @@
+obj-$(CONFIG_NRF24) += nrf24.o 
+nrf24-objs 			:= nrf24_funcs.o nrf24_base.o
