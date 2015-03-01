@@ -20,6 +20,7 @@
 #define HIGH	1
 
 #define TIO_NRF24_ACKPAYLOAD	0xF240
+#define TIO_NRF24_PAYLOADSIZE	0xF241
 
 #define _BV(x) (1<<(x))
 

@@ -100,12 +100,7 @@ uint8_t read_buffer_from_register(uint8_t reg, uint8_t* buf, uint8_t len)
 {
   struct nrf24_chip *ts = p_ts;
   unsigned char localBuf[MAX_PAYLOAD_SIZE];
- // uint8_t* first = buf;
-/*  int status = nrf24_read(ts,reg);
 
-  while ( len-- )
-    *buf++ = spi_w8r8(ts->spi,0xff);
-*/
   localBuf[0] = (R_REGISTER | ( REGISTER_MASK & reg ));
   spi_write_then_read(ts->spi, localBuf, 1, buf, len);
 
@@ -165,48 +160,13 @@ uint8_t write_payload(struct nrf24_chip *ts, const void* payload, uint8_t len)
 
   return status;
 }
-#if 0
-void writeAckPayload(struct nrf24_chip *ts, uint8_t pipe, const void* data, uint8_t len)
-{
-  int status;
-  uint8_t data_len = min(len,MAX_PAYLOAD_SIZE);
-  u8 buf[MAX_PAYLOAD_SIZE];
-//  printk("ts: %x, txb: %x, buf: %x, len: %d\n",(unsigned int)ts, (unsigned int)&ts->txbuf[0],(unsigned int)buf, data_len);
-//  printk("nio: %x, app: %x, pl: %x\n",(unsigned int)&ts->nioctl, (unsigned int)&ts->nioctl.ackPayload, *(unsigned int*)ts->nioctl.ackPayload);
 
-  buf[0] = ( W_ACK_PAYLOAD | ( pipe & 0b111 ) );
-  memcpy(&buf[1], data, data_len);
-  status = nrf24_write_from_buf(ts, buf, data_len+1);
-
-  return;
-}
-#endif
 /* ******************************** CONFIG ********************************* */
 
 /* ******************************** IRQ ********************************* */
 
 int nrf24_write_read(struct nrf24_chip *ts, u8 *txbuf, unsigned n_tx, u8 *spibuf, unsigned n_rx);
 
-#if 0
-#define RING_BUFFER_SIZE	256
-uint8_t readIndex=0, writeIndex=0;
-char ringBuf_rx[RING_BUFFER_SIZE];
-
-int copy_to_ring_buffer(char *buf, int len)
-{
-	uint8_t copylen, rblen;
-	rblen = (int)RING_BUFFER_SIZE - writeIndex;
-	copylen = min(len, (int)rblen);
-	memcpy(&ringBuf_rx[writeIndex], buf, copylen);
-	writeIndex += copylen;
-	copylen = (len-copylen);
-	if (copylen > 0) {
-		memcpy(&ringBuf_rx[writeIndex], buf, copylen);
-		writeIndex += copylen;
-	}
-	return 0;
-}
-#endif
 
 static void nrf24_set_ackpayload(struct nrf24_chip *ts)
 {
@@ -285,7 +245,8 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 void nrf24_callback(void *data)
 {
   struct nrf24_chip *ts = (struct nrf24_chip*)data;
-  int reg = ts->spiBuf[0];
+  int cmd = ts->spiBuf[0];
+  static unsigned char dataLen=0;
   unsigned long flags;
   static uint8_t chipStatus=0;
   unsigned char localBuf[MAX_PAYLOAD_SIZE];
@@ -294,30 +255,45 @@ void nrf24_callback(void *data)
   //write_register(STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
   spin_lock_irqsave(&ts->lock, flags);
 
-  switch (reg) 
+  switch (cmd)
   {
   case STATUS:
 	  chipStatus = ts->spiBuf[1];
-	  if (chipStatus & 0x40) {
+	  if ((chipStatus & 0x0E) != 0x0E) {
 		  //printk("S: %x\n", chipStatus);
-		  localBuf[0] = R_RX_PAYLOAD;
-		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,ts->payload_size);
+		  localBuf[0] = R_RX_PL_WID;
+		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
+	  }
+	  else if (chipStatus & 0x70) {
+		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
+		  localBuf[1] = 0x70;
+		  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
 	  }
 	  else {
-		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
-		  localBuf[1] = 0x70;
-		  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
+		  if (ts->queue) {
+			  ts->queue = 0;
+			  localBuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
+			  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
+		  }
+		  else {
+			  ts->pending = 0;
+		  }
 	  }
+	  break;
+  case R_RX_PL_WID:
+	  dataLen = min(ts->spiBuf[1],ts->payload_size);
+	  localBuf[0] = R_RX_PAYLOAD;
+	  nrf24_write_read(ts, localBuf, 1, ts->spiBuf, dataLen);
 	  break;
   case R_RX_PAYLOAD:
-	  async_handle_rx(ts,ts->payload_size);
+	  async_handle_rx(ts,dataLen);
 //	  copy_to_ring_buffer(ts->spiBuf,payload_size);
 	  if (chipStatus & 0x70) {
-		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
-		  localBuf[1] = 0x70;
-		  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
+		  localBuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
+		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
 	  }
 	  break;
+
   default:
 	  if (ts->queue) {
 		  ts->queue = 0;
@@ -567,6 +543,11 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 			ts->ackPayload = true;
 			nrf24_dowork(ts);
 			ret = 0;
+			break;
+		case TIO_NRF24_PAYLOADSIZE:
+			//memcpy(buf,(void*)arg,1);
+			ts->payload_size = *(char*)arg;
+			printk("Set payload size %d\n", ts->payload_size);
 			break;
 #if 0
 		case TCGETS:
