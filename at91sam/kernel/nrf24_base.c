@@ -93,7 +93,7 @@ static int nrf24_read(struct nrf24_chip *ts, unsigned reg)
 
 void ce(int level)
 {
-  at91_set_gpio_value(ce_pin,level);
+  gpio_set_value(ce_pin,level);
 }
 
 uint8_t read_buffer_from_register(uint8_t reg, uint8_t* buf, uint8_t len)
@@ -894,8 +894,14 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 
 	ce_pin = 111; /* AT91_PIN_PD15 */
 
-	at91_set_gpio_output(ce_pin,0);
-	ce(LOW);
+	if (!gpio_is_valid(ce_pin))
+		return -EINVAL;
+
+	if (gpio_request(ce_pin, "Radio_CE"))
+		return	-EINVAL;
+
+	if (gpio_direction_output(ce_pin,0))
+		return -EINVAL;
 
 	ts = kzalloc(sizeof(struct nrf24_chip), GFP_KERNEL);
 	if (!ts)
@@ -970,6 +976,7 @@ exit_uart0:
 exit_destroy:
 	dev_set_drvdata(&spi->dev, NULL);
 	kfree(ts);
+	gpio_free(ce_pin);
 	return 0;
 }
 
@@ -1025,7 +1032,7 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 	kfree(ts->spiBuf); /* Free the async SPI transfer buffer */
 	kfree(ts->txbuf); /* Free the transmit buffer */
 	kfree(ts);
-
+	gpio_free(ce_pin);
 	return 0;
 }
 
