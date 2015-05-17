@@ -96,9 +96,8 @@ void ce(int level)
   gpio_set_value(ce_pin,level);
 }
 
-uint8_t read_buffer_from_register(uint8_t reg, uint8_t* buf, uint8_t len)
+uint8_t read_buffer_from_register(struct nrf24_chip *ts, uint8_t reg, uint8_t* buf, uint8_t len)
 {
-  struct nrf24_chip *ts = p_ts;
   unsigned char localBuf[MAX_PAYLOAD_SIZE];
 
   localBuf[0] = (R_REGISTER | ( REGISTER_MASK & reg ));
@@ -189,12 +188,48 @@ static void nrf24_set_ackpayload(struct nrf24_chip *ts)
 	}
 }
 
+static void nrf24_handle_tx(struct nrf24_chip *ts)
+{
+	struct uart_port *uart = &ts->uart;
+	struct circ_buf *xmit = &uart->state->xmit;
+	u8 buf[MAX_PAYLOAD_SIZE];
+	unsigned long flags;
+	unsigned len;
+	int status, i;
+
+	if (uart_circ_empty(xmit) || uart_tx_stopped(uart)) {
+		/* No data to send or TX is stopped */
+		//printk(KERN_DEBUG " %s (%d) No data or stop tx\n",__func__, ch);
+		return;
+	}
+
+	while ((read_register(ts, FIFO_STATUS) & TX_EMPTY) == 0) {
+		msleep(100);
+	}
+	/* number of bytes to transfer to the fifo */
+	len = (int)uart_circ_chars_pending(xmit);
+
+	spin_lock_irqsave(&uart->lock, flags);
+	for (i = 1; i <= len ; i++) {
+		buf[i] = xmit->buf[xmit->tail];
+		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+	}
+	uart->icount.tx += len;
+	spin_unlock_irqrestore(&uart->lock, flags);
+
+	buf[0] = W_TX_PAYLOAD;
+	status = nrf24_write_from_buf(ts, buf, len+1);
+
+	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
+			uart_write_wakeup(uart);
+}
 
 static void nrf24_work_routine(struct work_struct *w)
 {
 	struct nrf24_chip *ts = container_of(w, struct nrf24_chip, work);
 
 	nrf24_set_ackpayload(ts);
+	nrf24_handle_tx(ts);
 }
 
 /* Trigger work thread*/
@@ -234,7 +269,7 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 
 	spin_unlock_irqrestore(&uart->lock, flags);
 
-	printk("Rx(%d) %x %x %x\n",rxlvl,ts->spiBuf[1],ts->spiBuf[2],ts->spiBuf[3]);
+	//printk("Rx(%d) %x %x %x\n",rxlvl,ts->spiBuf[1],ts->spiBuf[2],ts->spiBuf[3]);
 
 	/* Push the received data to receivers */
 	if (rxlvl)
@@ -549,6 +584,15 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 			ts->payload_size = *(char*)arg;
 			printk("Set payload size %d\n", ts->payload_size);
 			break;
+		case TIO_NRF24_GETCONFIG:
+			if (getConfiguration(ts) == 0) {
+				memcpy((void*)arg,&ts->radioConfig,sizeof(struct nrf24_config));
+				ret = 0;
+			}
+			else {
+				ret = -EBUSY;
+			}
+			break;
 #if 0
 		case TCGETS:
 			ret = 0;
@@ -611,7 +655,7 @@ void print_address_register(const char* name, uint8_t reg, uint8_t qty)
   {
     uint8_t buffer[5];
     uint8_t* bufptr;
-    read_buffer_from_register(reg++,buffer,sizeof buffer);
+    read_buffer_from_register(p_ts,reg++,buffer,sizeof buffer);
 
     printk(" 0x");
     bufptr = buffer + sizeof buffer;
@@ -880,28 +924,11 @@ static int nrf24_register_uart_port(struct nrf24_chip *ts,
 static int __devinit nrf24_probe(struct spi_device *spi)
 {
 	struct nrf24_chip *ts;
-	struct nrf24_platform_data platdata;
-	struct nrf24_platform_data *pdata = &platdata;
-	struct device *dev;
-	int minor = 2;
+//	struct nrf24_platform_data platdata;
+	struct nrf24_platform_data *pdata; // = &platdata;
 	int ret;
-
-	/* Get platform data for  module */
-//	pdata = spi->dev.platform_data;
-
-	pdata->uartclk = 16000000;
-	pdata->uart_base = 0;
-
-	ce_pin = 111; /* AT91_PIN_PD15 */
-
-	if (!gpio_is_valid(ce_pin))
-		return -EINVAL;
-
-	if (gpio_request(ce_pin, "Radio_CE"))
-		return	-EINVAL;
-
-	if (gpio_direction_output(ce_pin,0))
-		return -EINVAL;
+	int irq_num;
+	char *tmp;
 
 	ts = kzalloc(sizeof(struct nrf24_chip), GFP_KERNEL);
 	if (!ts)
@@ -913,6 +940,39 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 
 	spi_set_drvdata(spi, ts);
 	ts->spi = spi;
+
+	/* Get platform data for  module */
+	pdata = (struct nrf24_platform_data*)spi->dev.platform_data;
+	if (pdata == NULL)
+		return -ENOTTY;
+	printk("%x\n",(unsigned int)pdata);
+//	pdata->uartclk = 16000000;
+//	pdata->uart_base = 0;
+//	printk("%x vs %x\n",(unsigned int)pdata, (unsigned int)spi->controller_data);
+//	pdata = (struct nrf24_platform_data*)spi->controller_data;
+//	ce_pin = 111; /* AT91_PIN_PD15 */
+
+	tmp = (char*)spi->dev.platform_data;
+	dev_info(&spi->dev, TYPE_NAME " Alias %s\n",spi->modalias);
+	dev_info(&spi->dev, TYPE_NAME " IRQ pin %d (%d)\n",spi->irq, gpio_to_irq(spi->irq));
+	dev_info(&spi->dev, TYPE_NAME " %x %x %x %x\n",tmp[0],tmp[1],tmp[2],tmp[3]);
+	dev_info(&spi->dev, TYPE_NAME " CE pin %d\n",pdata->ce_pin);
+	dev_info(&spi->dev, TYPE_NAME " pipes %d\n",pdata->active_pipes);
+	dev_info(&spi->dev, TYPE_NAME " combo %d\n",pdata->combine_pipes);
+	dev_info(&spi->dev, TYPE_NAME " uclk %d\n",pdata->uartclk);
+	dev_info(&spi->dev, TYPE_NAME " ubase %d\n",pdata->uart_base);
+	ce_pin = pdata->ce_pin;
+
+
+	if (!gpio_is_valid(ce_pin))
+		return -EINVAL;
+
+	if (gpio_request(ce_pin, "Radio_CE"))
+		return	-EINVAL;
+
+	if (gpio_direction_output(ce_pin,0))
+		return -EINVAL;
+
 	mutex_init(&ts->txlock);
 
 	/* Allocate the async SPI transfer structures */
@@ -942,7 +1002,7 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 
 	/* Setup IRQ. Actually we have a low active IRQ, but we want
 	 * one shot behaviour */
-	int irq_num = 105;//gpio_to_irq(ts->spi->irq);
+	irq_num = gpio_to_irq(ts->spi->irq); // 57 -> 105
 	if (irq_num < 0) {
 		dev_err(&ts->spi->dev, "GPIO to IRQ failed\n");
 	}
@@ -965,8 +1025,8 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 			spi->chip_select, spi->irq);
 
 
-	dev_info(&spi->dev, TYPE_NAME " IRQ handler %x\n",(int)nrf24_irq);
-	printk(" ts pointer %x\n",(int)ts);
+	dev_info(&spi->dev, TYPE_NAME " active pipe mask: %x\n",pdata->active_pipes);
+	//printk(" ts pointer %x\n",(int)ts);
 
 
 	return 0;
