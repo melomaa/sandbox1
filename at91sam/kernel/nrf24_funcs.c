@@ -320,5 +320,33 @@ rf24_crclength_e getCRCLength(struct nrf24_chip *ts)
   return result;
 }
 
+int getConfiguration(struct nrf24_chip *ts)
+{
+	uint8_t reg;
+	int i;
+
+	read_buffer_from_register(ts,RX_ADDR_P0,ts->radioConfig.rxAddr0,5);
+	read_buffer_from_register(ts,RX_ADDR_P1,ts->radioConfig.rxAddr1,5);
+	reg = RX_ADDR_P2;
+	for (i=0; i<4; i++) {
+		ts->radioConfig.rxAddrN[i] = read_register(ts, reg+i);
+	}
+	read_buffer_from_register(ts,TX_ADDR,ts->radioConfig.txAddr,5);
+	reg = RX_PW_P0;
+	for (i=0; i<6; i++) {
+		ts->radioConfig.rxWidth[i] = read_register(ts, reg+i);
+	}
+	ts->radioConfig.autoAck = read_register(ts, EN_AA);
+	ts->radioConfig.rxEnable = read_register(ts, EN_RXADDR);
+	ts->radioConfig.channel = read_register(ts, RF_CH);
+	ts->radioConfig.setup = read_register(ts, RF_SETUP);
+	ts->radioConfig.config = read_register(ts, CONFIG);
+	ts->radioConfig.dynpd = read_register(ts, DYNPD);
+	ts->radioConfig.feature = read_register(ts, FEATURE);
+	ts->radioConfig.retransmit = read_register(ts, SETUP_RETR);
+	ts->radioConfig.addrWidth = read_register(ts, SETUP_AW);
+
+	return 0;
+}
 
 
