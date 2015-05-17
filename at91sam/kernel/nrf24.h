@@ -19,8 +19,11 @@
 #define LOW		0
 #define HIGH	1
 
-#define TIO_NRF24_ACKPAYLOAD	0xF240
-#define TIO_NRF24_PAYLOADSIZE	0xF241
+enum {
+	TIO_NRF24_ACKPAYLOAD = 0xF240,
+	TIO_NRF24_PAYLOADSIZE,
+	TIO_NRF24_GETCONFIG,
+};
 
 #define _BV(x) (1<<(x))
 
@@ -45,6 +48,32 @@ typedef enum { RF24_1MBPS = 0, RF24_2MBPS, RF24_250KBPS } rf24_datarate_e;
  */
 typedef enum { RF24_CRC_DISABLED = 0, RF24_CRC_8, RF24_CRC_16 } rf24_crclength_e;
 
+struct nrf24_platform_data {
+	int	ce_pin;
+	u8	active_pipes;
+	u8	combine_pipes;
+	unsigned int	uartclk;
+	/* uart line number of the first channel */
+	unsigned	uart_base;
+};
+
+struct nrf24_config {
+	uint8_t rxAddr0[5];
+	uint8_t rxAddr1[5];
+	uint8_t	rxAddrN[4];
+	uint8_t txAddr[5];
+	uint8_t	rxWidth[6];
+	uint8_t	autoAck;
+	uint8_t rxEnable;
+	uint8_t	channel;
+	uint8_t setup;
+	uint8_t config;
+	uint8_t dynpd;
+	uint8_t feature;
+	uint8_t retransmit;
+	uint8_t addrWidth;
+};
+
 struct nrf24_ioctl {
 	int pipe;
 	char ackPayload[32];
@@ -55,13 +84,13 @@ struct nrf24_chip {
 	struct spi_device *spi;
 	struct uart_port	uart;
 	dev_t                   devt;
-//	struct nrf24_channel channel[6];
+	//	struct nrf24_channel channel[6];
 	spinlock_t              lock;
 	u8		pending;	/* Async transfer active (only one at a time)*/
 	u8		state;		/* Which state (async spi) is being handled */
 	u8 		queue;		/* Queued interrupt */
-        struct spi_message      message; /* Message struct for async transfer */
-        struct spi_transfer     *transfers; /* Transfer structs for the async message */
+	struct spi_message      message; /* Message struct for async transfer */
+	struct spi_transfer     *transfers; /* Transfer structs for the async message */
 	u8 		*spiBuf;	/* Buffer for message data */
 	u8		*txbuf;
 	struct mutex txlock;
@@ -71,26 +100,34 @@ struct nrf24_chip {
 	bool	ackPayload;
 	struct workqueue_struct *workqueue;
 	struct work_struct	work;
-	  uint8_t payload_size; /**< Fixed size of payloads */
-	  bool dynamic_payloads_enabled; /**< Whether dynamic payloads are enabled. */
-	  bool wide_band; /* 2Mbs data rate in use? */
+	uint8_t payload_size; /**< Fixed size of payloads */
+	bool dynamic_payloads_enabled; /**< Whether dynamic payloads are enabled. */
+	bool wide_band; /* 2Mbs data rate in use? */
+	struct nrf24_config	radioConfig;
 };
 
+#if 0
 struct nrf24_platform_data {
 	unsigned int	uartclk;
 	/* uart line number of the first channel */
 	unsigned	uart_base;
 };
+#endif
 
+/*
 typedef struct nrf24_configuration {
 	int payload;
 	
 }nrf24_config_t;
+*/
+
 
 void ce(int level);
 int nrf24_write_from_buf(struct nrf24_chip *ts, u8 *buf, u8 len);
 uint8_t write_register(struct nrf24_chip *ts, uint8_t reg, uint8_t val);
 uint8_t write_buffer_to_register(struct nrf24_chip *ts, uint8_t reg, const uint8_t* data, uint8_t len);
 uint8_t read_register(struct nrf24_chip *ts, uint8_t reg);
+uint8_t read_buffer_from_register(struct nrf24_chip *ts, uint8_t reg, uint8_t* buf, uint8_t len);
+int getConfiguration(struct nrf24_chip *ts);
 
 #endif
