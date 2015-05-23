@@ -1,5 +1,6 @@
 
 #include "nrf24.h"
+#include <linux/platform_device.h>
 #include <linux/workqueue.h>
 #include <linux/freezer.h>
 #include <linux/tty_flip.h>
@@ -196,16 +197,41 @@ static void nrf24_handle_tx(struct nrf24_chip *ts)
 	unsigned long flags;
 	unsigned len;
 	int status, i;
+	int cnt = 10;
+	static u8 txOn = 0;
+
+	printk("Handle tx\n");
 
 	if (uart_circ_empty(xmit) || uart_tx_stopped(uart)) {
 		/* No data to send or TX is stopped */
 		//printk(KERN_DEBUG " %s (%d) No data or stop tx\n",__func__, ch);
+		if (txOn) {
+			startListening(ts);
+			msleep(1);
+			txOn = 0;
+		}
 		return;
 	}
 
-	while ((read_register(ts, FIFO_STATUS) & TX_EMPTY) == 0) {
+	status = read_register(ts, FIFO_STATUS);
+	while ((status & (1<<TX_EMPTY)) == 0 && cnt > 0) {
 		msleep(100);
+		cnt--;
 	}
+
+	if (cnt == 0) {
+		flush_tx(ts);
+		status = read_register(ts, FIFO_STATUS);
+		if ((status & (1<<TX_EMPTY)) == 0) {
+			dev_info(&ts->spi->dev, "%s: FIFO not empty. Cannot TX.\n", __func__);
+			return;
+		}
+	}
+	if (!txOn) {
+		txOn = 1;
+		stopListening(ts);
+	}
+
 	/* number of bytes to transfer to the fifo */
 	len = (int)uart_circ_chars_pending(xmit);
 
@@ -217,6 +243,8 @@ static void nrf24_handle_tx(struct nrf24_chip *ts)
 	uart->icount.tx += len;
 	spin_unlock_irqrestore(&uart->lock, flags);
 
+	buf[len+1] = 0;
+	printk("TX(%d) %s\n", len, buf);
 	buf[0] = W_TX_PAYLOAD;
 	status = nrf24_write_from_buf(ts, buf, len+1);
 
@@ -295,9 +323,16 @@ void nrf24_callback(void *data)
   case STATUS:
 	  chipStatus = ts->spiBuf[1];
 	  if ((chipStatus & 0x0E) != 0x0E) {
-		  //printk("S: %x\n", chipStatus);
+		  printk("S: %x\n", chipStatus);
 		  localBuf[0] = R_RX_PL_WID;
 		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
+	  }
+	  else if (chipStatus & (1<<TX_DS)) {
+		  printk("TX data send\n");
+		  nrf24_dowork(ts);
+		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
+		  		  localBuf[1] = 0x70;
+		  		  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
 	  }
 	  else if (chipStatus & 0x70) {
 		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
@@ -479,9 +514,6 @@ static int nrf24_open(struct uart_port *port)
 	struct nrf24_chip *ts = to_nrf24_struct(port);
 
 	printk("Port: %x, ts: %x\n",(int)port,(int)ts);
-	// Flush buffers
-//  flush_rx();
-//  flush_tx();
 
 	if (ts == NULL)
 		return -1;
@@ -801,7 +833,7 @@ static void nrf24_shutdown(struct uart_port *port)
 static unsigned int nrf24_tx_empty(struct uart_port *port)
 {
 	printk("%s\n", __func__);
-	return 1;
+	return TIOCSER_TEMT;
 }
 
 static unsigned int nrf24_get_mctrl(struct uart_port *port)
@@ -816,10 +848,22 @@ static void nrf24_set_mctrl(struct uart_port *port, unsigned int mctrl)
 	mcr = mctrl;
 }
 
+static void nrf24_enable_ms(struct uart_port *port)
+{
+	/* Do nothing */
+	printk("%s\n", __func__);
+}
+
+static void nrf24_break_ctl(struct uart_port *port, int break_state)
+{
+	/* Do nothing */
+	printk("%s\n", __func__);
+}
 
 static void nrf24_stop_tx(struct uart_port *port)
 {
 	/* Do nothing */
+	printk("%s\n", __func__);
 }
 
 static void nrf24_start_tx(struct uart_port *port)
@@ -833,7 +877,7 @@ static void nrf24_start_tx(struct uart_port *port)
 	dev_dbg(&ts->spi->dev, "%s\n", __func__);
 
 	/* Trigger work thread for sending data */
-	//nrf24_dowork(chan);
+	nrf24_dowork(ts);
 }
 
 static void nrf24_stop_rx(struct uart_port *port)
@@ -877,9 +921,9 @@ static struct uart_ops nrf24_uart_ops = {
 	.stop_tx        = nrf24_stop_tx,
 	.start_tx	= nrf24_start_tx,
 	.stop_rx	= nrf24_stop_rx,
-/*	.enable_ms      = sc16is7x2_enable_ms,
-	.break_ctl      = sc16is7x2_break_ctl,
-	*/
+	.enable_ms  = nrf24_enable_ms,
+	.break_ctl      = nrf24_break_ctl,
+
 	.startup	= nrf24_open,
 	.shutdown	= nrf24_shutdown,
 	.set_termios	= nrf24_set_termios,
@@ -1007,7 +1051,6 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 		dev_err(&ts->spi->dev, "GPIO to IRQ failed\n");
 	}
 	else {
-		ts->spi->irq = irq_num;
 		if (request_any_context_irq(irq_num, nrf24_irq,
 				IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING | IRQF_SHARED,
 				"nrf24", ts)) {
@@ -1053,7 +1096,7 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 		return -ENODEV;
 	printk("ts->spi %x\n",(int)ts->spi);
 
-	printk("ts->spi->irq %x\n",(int)ts->spi->irq);
+	printk("ts->spi->irq %d\n",(int)ts->spi->irq);
 
 	if (&ts->lock == NULL)
 		return -ENODEV;
@@ -1066,7 +1109,7 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 	printk("ts->devt %x\n",(int)ts->devt);
 #endif
 	/* Free the interrupt */
-	free_irq(ts->spi->irq, ts);
+	free_irq(gpio_to_irq(ts->spi->irq), ts);
 
 
 

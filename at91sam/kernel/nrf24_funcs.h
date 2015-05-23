@@ -44,6 +44,8 @@ void openReadingPipe(struct nrf24_chip *ts, uint8_t child, uint64_t address);
 
 void startListening(struct nrf24_chip *ts);
 
+void stopListening(struct nrf24_chip *ts);
+
 void setAutoAck(struct nrf24_chip *ts, bool enable);
 
 rf24_crclength_e getCRCLength(struct nrf24_chip *ts);
