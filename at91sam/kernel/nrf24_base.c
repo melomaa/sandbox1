@@ -234,18 +234,43 @@ static void nrf24_handle_tx(struct nrf24_chip *ts)
 
 	/* number of bytes to transfer to the fifo */
 	len = (int)uart_circ_chars_pending(xmit);
+	//if (len > 15) len = 15;
+	printk("xmit chars %d\n", len);
 
 	spin_lock_irqsave(&uart->lock, flags);
+#if 0
+	buf[1] = xmit->buf[xmit->tail];
+	xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+	buf[2] = xmit->buf[xmit->tail];
+	xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+	for (i = 2; i <= len ; i++) {
+		buf[i] = xmit->buf[xmit->tail];
+		if (buf[i] == 0x0d && buf[i-1] == 0 && buf[i-2] == 0) {
+			buf[i] = 0x00;
+		}
+		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
+	}
+	if (len == 16) {
+		memcpy(&buf[9], &buf[10], 6);
+	}
+#else
 	for (i = 1; i <= len ; i++) {
 		buf[i] = xmit->buf[xmit->tail];
 		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
 	}
+#endif
 	uart->icount.tx += len;
+	uart_circ_clear(xmit);
 	spin_unlock_irqrestore(&uart->lock, flags);
-
-	buf[len+1] = 0;
-	printk("TX(%d) %s\n", len, buf);
+	if (len > 14) len = 14;
+//	buf[len+1] = 0;
+//	printk("TX(%d) %s\n", len, buf);
 	buf[0] = W_TX_PAYLOAD;
+	printk("TX(%d): ",len);
+	for (i=0; i<=len; i++) {
+		printk("%x ",buf[i]);
+	}
+	printk("\n");
 	status = nrf24_write_from_buf(ts, buf, len+1);
 
 	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
@@ -323,7 +348,7 @@ void nrf24_callback(void *data)
   case STATUS:
 	  chipStatus = ts->spiBuf[1];
 	  if ((chipStatus & 0x0E) != 0x0E) {
-		  printk("S: %x\n", chipStatus);
+		  //printk("S: %x\n", chipStatus);
 		  localBuf[0] = R_RX_PL_WID;
 		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
 	  }
