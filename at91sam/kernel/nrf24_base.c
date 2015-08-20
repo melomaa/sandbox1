@@ -20,8 +20,6 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/of_gpio.h>
-//#include <asm/uaccess.h>
-
 
 #include "nrf24_funcs.h"
 
@@ -33,20 +31,9 @@
 #define SPI_MAX_TRANSFERS	8
 #define BUFFER_SIZE		(FIFO_SIZE*4)
 
-
-#define SPIDEV_MAJOR                    153     /* assigned */
-#define N_SPI_MINORS                    32      /* ... up to 256 */
-
-
-
-
-
-
 void printDetails(void);
 
-//static DECLARE_BITMAP(minors, N_SPI_MINORS);
-
-  uint8_t ce_pin; /**< "Chip Enable" pin, activates the RX or TX role */
+uint8_t ce_pin; /**< "Chip Enable" pin, activates the RX or TX role */
 
 //  bool p_variant; /* False for RF24L01 and true for RF24L01P */
 
@@ -54,7 +41,6 @@ void printDetails(void);
 
 //  uint8_t ack_payload_length; /**< Dynamic size of pending ack payload. */
 //  uint64_t pipe0_reading_address; /**< Last address set on pipe 0 for reading. */
-  //static const uint8_t max_payload_size = 32;
 static struct nrf24_chip *p_ts;
 static unsigned int mcr = 0;
 
@@ -146,19 +132,12 @@ uint8_t write_register(struct nrf24_chip *ts, uint8_t reg, uint8_t val)
 uint8_t write_payload(struct nrf24_chip *ts, const void* payload, uint8_t len)
 {
   uint8_t status;
-
-//  const uint8_t* current = reinterpret_cast<const uint8_t*>(buf);
   u8 buf[MAX_PAYLOAD_SIZE];
   uint8_t data_len = min(len,ts->payload_size);
   uint8_t blank_len = ts->dynamic_payloads_enabled ? 0 : ts->payload_size - data_len;
 
-  
-  //printf("[Writing %u bytes %u blanks]",data_len,blank_len);
-
   buf[0] = ( W_TX_PAYLOAD );
-//  status = nrf24_write(ts, 1);
   memcpy(&buf[1], payload, data_len);
-//  status = nrf24_write(ts, data_len);
   memset(&buf[data_len + 1], 0, blank_len);
   status = nrf24_write_from_buf(ts, buf, 1 + data_len + blank_len);
 
@@ -170,7 +149,6 @@ uint8_t write_payload(struct nrf24_chip *ts, const void* payload, uint8_t len)
 /* ******************************** IRQ ********************************* */
 
 int nrf24_write_read(struct nrf24_chip *ts, u8 *txbuf, unsigned n_tx, u8 *spibuf, unsigned n_rx);
-
 
 static void nrf24_set_ackpayload(struct nrf24_chip *ts)
 {
@@ -204,11 +182,8 @@ static void nrf24_handle_tx(struct nrf24_chip *ts)
 	int cnt = 10;
 	static u8 txOn = 0;
 
-	printk("Handle tx\n");
-
 	if (uart_circ_empty(xmit) || uart_tx_stopped(uart)) {
 		/* No data to send or TX is stopped */
-		//printk(KERN_DEBUG " %s (%d) No data or stop tx\n",__func__, ch);
 		if (txOn) {
 			startListening(ts);
 			msleep(1);
@@ -238,47 +213,34 @@ static void nrf24_handle_tx(struct nrf24_chip *ts)
 
 	/* number of bytes to transfer to the fifo */
 	len = (int)uart_circ_chars_pending(xmit);
-	//if (len > 15) len = 15;
-	printk("xmit chars %d\n", len);
-
+	dev_dbg(&ts->spi->dev, "xmit chars %d\n", len);
+	if (len > MAX_PAYLOAD_SIZE) {
+	    len = MAX_PAYLOAD_SIZE;
+	}
+	else if (ts->payload_size && (len > ts->payload_size)) {
+	    len = ts->payload_size;
+	}
 	spin_lock_irqsave(&uart->lock, flags);
-#if 0
-	buf[1] = xmit->buf[xmit->tail];
-	xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
-	buf[2] = xmit->buf[xmit->tail];
-	xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
-	for (i = 2; i <= len ; i++) {
-		buf[i] = xmit->buf[xmit->tail];
-		if (buf[i] == 0x0d && buf[i-1] == 0 && buf[i-2] == 0) {
-			buf[i] = 0x00;
-		}
-		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
-	}
-	if (len == 16) {
-		memcpy(&buf[9], &buf[10], 6);
-	}
-#else
 	for (i = 1; i <= len ; i++) {
 		buf[i] = xmit->buf[xmit->tail];
 		xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
 	}
-#endif
+
 	uart->icount.tx += len;
 	uart_circ_clear(xmit);
 	spin_unlock_irqrestore(&uart->lock, flags);
-	if (len > 14) len = 14;
-//	buf[len+1] = 0;
-//	printk("TX(%d) %s\n", len, buf);
 	buf[0] = W_TX_PAYLOAD;
-	printk("TX(%d): ",len);
+	/* Debug print */
+	dev_dbg(&ts->spi->dev, "TX(%d): ", len);
 	for (i=0; i<=len; i++) {
-		printk("%x ",buf[i]);
+	    dev_dbg(&ts->spi->dev, "%x ",buf[i]);
 	}
-	printk("\n");
+	dev_dbg(&ts->spi->dev, "\n");
+	/* Transfer to SPI */
 	status = nrf24_write_from_buf(ts, buf, len+1);
 
 	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
-			uart_write_wakeup(uart);
+	    uart_write_wakeup(uart);
 }
 
 static void nrf24_work_routine(struct work_struct *w)
@@ -327,8 +289,6 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 
 	spin_unlock_irqrestore(&uart->lock, flags);
 
-	//printk("Rx(%d) %x %x %x\n",rxlvl,ts->spiBuf[1],ts->spiBuf[2],ts->spiBuf[3]);
-
 	/* Push the received data to receivers */
 	if (rxlvl)
 		tty_flip_buffer_push(tport);
@@ -344,8 +304,6 @@ void nrf24_callback(void *data)
   static uint8_t chipStatus=0;
   unsigned char localBuf[MAX_PAYLOAD_SIZE];
 
-  //printk("Callback (%x): %x\n", reg, ts->spiBuf[1]);
-  //write_register(STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
   spin_lock_irqsave(&ts->lock, flags);
 
   switch (cmd)
@@ -353,12 +311,12 @@ void nrf24_callback(void *data)
   case STATUS:
 	  chipStatus = ts->spiBuf[1];
 	  if ((chipStatus & 0x0E) != 0x0E) {
-		  //printk("S: %x\n", chipStatus);
+		  dev_dbg(&ts->spi->dev, "S: %x\n", chipStatus);
 		  localBuf[0] = R_RX_PL_WID;
 		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
 	  }
 	  else if (chipStatus & (1<<TX_DS)) {
-		  printk("TX data send\n");
+		  dev_dbg(&ts->spi->dev, "TX data send\n");
 		  nrf24_dowork(ts);
 		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
 		  		  localBuf[1] = 0x70;
@@ -387,7 +345,6 @@ void nrf24_callback(void *data)
 	  break;
   case R_RX_PAYLOAD:
 	  async_handle_rx(ts,dataLen);
-//	  copy_to_ring_buffer(ts->spiBuf,payload_size);
 	  if (chipStatus & 0x70) {
 		  localBuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
 		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
@@ -400,12 +357,6 @@ void nrf24_callback(void *data)
 		  localBuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
 		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
 	  }
-#if 0
-	  else if (ts->todo) {
-		  nrf24_dowork(ts);
-		  ts->todo = false;
-	  }
-#endif
 	  else {
 		  ts->pending = 0;
 	  }
@@ -460,13 +411,7 @@ int nrf24_write_read(struct nrf24_chip *ts,
 
         return status;
 }
-/*
-  uint8_t data_len = min(len,payload_size);
-  uint8_t blank_len = dynamic_payloads_enabled ? 0 : payload_size - data_len;
 
-  ts->txbuf[0] = ( R_RX_PAYLOAD );
-  status = sc_write_read(ts->txbuf,1,ts->spiBuf,data_len+blank_len);
-*/
 uint8_t get_status(struct nrf24_chip *ts)
 {
   return read_register(ts, STATUS);
@@ -493,8 +438,6 @@ static irqreturn_t nrf24_irq(int irq, void *data)
 	struct nrf24_chip *ts = data;
 	unsigned long flags;
 
-	//printk("IRQ ");
-
 	spin_lock_irqsave(&ts->lock, flags);
 	if (ts->pending != 0) {
 		ts->queue = 1;
@@ -502,36 +445,11 @@ static irqreturn_t nrf24_irq(int irq, void *data)
 	else {
 		ts->pending = 1;
 		get_register_async(ts,STATUS);
-//		get_status_async(ts);
 	}
 	spin_unlock_irqrestore(&ts->lock, flags);
 
   return IRQ_HANDLED;
 }
-/*
-uint8_t RF24::read_payload(void* buf, uint8_t len)
-{
-  uint8_t status;
-  uint8_t* current = reinterpret_cast<uint8_t*>(buf);
-
-  uint8_t data_len = min(len,payload_size);
-  uint8_t blank_len = dynamic_payloads_enabled ? 0 : payload_size - data_len;
-  
-  //printf("[Reading %u bytes %u blanks]",data_len,blank_len);
-  
-  csn(LOW);
-  status = spi->transfer( R_RX_PAYLOAD );
-  while ( data_len-- )
-    *current++ = spi->transfer(0xff);
-  while ( blank_len-- )
-    spi->transfer(0xff);
-  csn(HIGH);
-
-
-  return status;
-}
-*/
-
 
 /* ******************************** FOPS ********************************* */
 
@@ -547,9 +465,9 @@ static int nrf24_open(struct uart_port *port)
 
 	if (ts == NULL)
 		return -1;
-  powerUp(ts); //Power up by default when open() is called
+  	powerUp(ts); //Power up by default when open() is called
 
-  ts->ackPayload = false;
+  	ts->ackPayload = false;
 	/* Initialize work queue */
 	ts->workqueue = create_freezable_workqueue("nrf24");
 	if (!ts->workqueue) {
@@ -558,41 +476,15 @@ static int nrf24_open(struct uart_port *port)
 	}
 	INIT_WORK(&ts->work, nrf24_work_routine);
 
-  msleep(2);
-//  filp->private_data =p_ts;
+  	msleep(2);
 
-  startListening(ts);
+ 	startListening(ts);
 
-  msleep(1);
-  printDetails();
+  	msleep(1);
+  	printDetails();
 
-  return 0;
+  	return 0;
 }
-#if 0
-/* Read-only message with current device setup */
-static ssize_t
-nrf24dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
-{
-	size_t bytes=0;
-
-	if(readIndex != writeIndex) {
-		if(writeIndex > readIndex) {
-			bytes = min((int)count,((int)writeIndex-readIndex));
-			bytes = copy_to_user(buf,&ringBuf_rx[readIndex],bytes);
-		}
-	}
-	return bytes;
-}
-
-/* Write-only message with current device setup */
-static ssize_t
-nrf24dev_write(struct file *filp, const char __user *buf,
-		size_t count, loff_t *f_pos)
-{
-	return 0;
-}
-#endif
-//static long nrf24dev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned long arg)
 {
 	struct nrf24_chip *ts;
@@ -602,7 +494,6 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 
 	printk(" Command %d, pointer %x\n",cmd,(unsigned int)arg);
 
-//	ts = filp->private_data;
 	ts = to_nrf24_struct(port);
 	if (ts == NULL)
 		return ret;
@@ -642,7 +533,6 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 			ret = 0;
 			break;
 		case TIO_NRF24_PAYLOADSIZE:
-			//memcpy(buf,(void*)arg,1);
 			ts->payload_size = *(char*)arg;
 			printk("Set payload size %d\n", ts->payload_size);
 			break;
@@ -669,7 +559,7 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 		}
 	}
 	else {
-		printk("SPI Timeout\n");
+		ret = -EAGAIN;
 	}
 
 	return ret;
@@ -792,7 +682,7 @@ int default_configuration(struct nrf24_chip *ts)
   write_register(ts, STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
 
 // enable dynamic payloads
-	enableDynamicPayloads(ts);
+  enableDynamicPayloads(ts);
 
 	setAutoAck(ts, 1);
 	enableAckPayload(ts);
