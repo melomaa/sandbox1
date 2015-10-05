@@ -16,6 +16,10 @@
 #include <linux/errno.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+
+#include <linux/of.h>
+#include <linux/of_device.h>
+#include <linux/of_gpio.h>
 //#include <asm/uaccess.h>
 
 
@@ -296,6 +300,7 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 {
 	struct uart_port *uart = &ts->uart;
 	struct tty_struct *tty = uart->state->port.tty;
+	struct tty_port *tport = &uart->state->port;
 	unsigned long flags;
 
 	/* Check that transfer was successful */
@@ -316,7 +321,7 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 
 	spin_lock_irqsave(&uart->lock, flags);
 	/* Insert received data */
-	tty_insert_flip_string(tty, &ts->spiBuf[1], rxlvl);
+	tty_insert_flip_string(tport, &ts->spiBuf[1], rxlvl);
 	/* Update RX counter */
 	uart->icount.rx += rxlvl;
 
@@ -326,7 +331,7 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 
 	/* Push the received data to receivers */
 	if (rxlvl)
-		tty_flip_buffer_push(tty);
+		tty_flip_buffer_push(tport);
 
 }
 
@@ -932,7 +937,7 @@ nrf24_set_termios(struct uart_port *port, struct ktermios *termios,
 	ts = to_nrf24_struct(port);
 	spin_lock_irqsave(&ts->uart.lock, flags);
 	/* we are sending char from a workqueue so enable */
-	ts->uart.state->port.tty->low_latency = 1;
+	//ts->uart.state->port.tty->low_latency = 1;
 	/* Update the per-port timeout. */
 	uart_update_timeout(port, termios->c_cflag, 57600);
 	spin_unlock_irqrestore(&ts->uart.lock, flags);
@@ -968,15 +973,9 @@ static struct uart_driver nrf24_uart_driver = {
 	.nr             = 1,
 };
 
-static int nrf24_register_uart_port(struct nrf24_chip *ts,
-		struct nrf24_platform_data *pdata, int ch)
+static int nrf24_register_uart_port(struct nrf24_chip *ts,struct nrf24_platform_data *pdata, int ch)
 {
 	struct uart_port *uart = &ts->uart;
-
-	/* Disable irqs and go to sleep */
-//	sc16is7x2_write(ts, UART_IER, ch, UART_IERX_SLEEP);
-
-//	chan->chip = ts;
 
 	uart->irq = ts->spi->irq;
 	uart->uartclk = pdata->uartclk;
@@ -990,7 +989,7 @@ static int nrf24_register_uart_port(struct nrf24_chip *ts,
 	return uart_add_one_port(&nrf24_uart_driver, uart);
 }
 
-static int __devinit nrf24_probe(struct spi_device *spi)
+static int nrf24_probe(struct spi_device *spi)
 {
 	struct nrf24_chip *ts;
 //	struct nrf24_platform_data platdata;
@@ -998,6 +997,7 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 	int ret;
 	int irq_num;
 	char *tmp;
+	struct device_node *np = spi->dev.of_node;
 
 	ts = kzalloc(sizeof(struct nrf24_chip), GFP_KERNEL);
 	if (!ts)
@@ -1009,9 +1009,23 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 
 	spi_set_drvdata(spi, ts);
 	ts->spi = spi;
-
+ if (np) {
+   pdata = devm_kzalloc(&spi->dev, sizeof(*pdata), GFP_KERNEL);
+         if (!pdata) {
+                 dev_err(&spi->dev, "could not allocate memory for pdata\n");
+                 return (-ENOMEM);
+         }
+	pdata->ce_pin = of_get_named_gpio(np,"ce-gpio", 0);
+        pdata->active_pipes = 7;
+        pdata->combine_pipes = 1;
+        pdata->uartclk = 16000000;
+        pdata->uart_base = 0;
+        printk("Device tree config\n");
+}
+else {
 	/* Get platform data for  module */
 	pdata = (struct nrf24_platform_data*)spi->dev.platform_data;
+}
 	if (pdata == NULL)
 		return -ENOTTY;
 	printk("%x\n",(unsigned int)pdata);
@@ -1021,10 +1035,10 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 //	pdata = (struct nrf24_platform_data*)spi->controller_data;
 //	ce_pin = 111; /* AT91_PIN_PD15 */
 
-	tmp = (char*)spi->dev.platform_data;
+//	tmp = (char*)spi->dev.platform_data;
 	dev_info(&spi->dev, TYPE_NAME " Alias %s\n",spi->modalias);
 	dev_info(&spi->dev, TYPE_NAME " IRQ pin %d (%d)\n",spi->irq, gpio_to_irq(spi->irq));
-	dev_info(&spi->dev, TYPE_NAME " %x %x %x %x\n",tmp[0],tmp[1],tmp[2],tmp[3]);
+//	dev_info(&spi->dev, TYPE_NAME " %x %x %x %x\n",tmp[0],tmp[1],tmp[2],tmp[3]);
 	dev_info(&spi->dev, TYPE_NAME " CE pin %d\n",pdata->ce_pin);
 	dev_info(&spi->dev, TYPE_NAME " pipes %d\n",pdata->active_pipes);
 	dev_info(&spi->dev, TYPE_NAME " combo %d\n",pdata->combine_pipes);
@@ -1108,7 +1122,7 @@ exit_destroy:
 	return 0;
 }
 
-static int __devexit nrf24_remove(struct spi_device *spi)
+static int nrf24_remove(struct spi_device *spi)
 {
 	struct nrf24_chip *ts = spi_get_drvdata(spi);
 	int ret;
@@ -1164,15 +1178,23 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 	return 0;
 }
 
+static const struct of_device_id nrf24spi_dt_ids[] = {
+        { .compatible = "nrf24L01" },
+        {},
+};
+
+MODULE_DEVICE_TABLE(of, nrf24spi_dt_ids);
+
 /* Spi driver data */
 static struct spi_driver nrf24_spi_driver = {
 	.driver = {
 		.name		= DRIVER_NAME,
 		.bus		= &spi_bus_type,
 		.owner		= THIS_MODULE,
+		.of_match_table = of_match_ptr(nrf24spi_dt_ids),
 	},
 	.probe		= nrf24_probe,
-	.remove		= __devexit_p(nrf24_remove),
+	.remove		= nrf24_remove,
 };
 
 /* Driver init function */
