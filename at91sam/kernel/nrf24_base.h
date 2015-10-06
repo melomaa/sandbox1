@@ -23,11 +23,13 @@ enum {
 	TIO_NRF24_ACKPAYLOAD = 0xF240,
 	TIO_NRF24_PAYLOADSIZE,
 	TIO_NRF24_GETCONFIG,
+	TIO_NRF24_SETCHANNEL,
 };
 
 enum {
 	NRF24_NO_COMMAND,
 	NRF24_POWERDOWN,
+	NRF24_SETCHANNEL,
 };
 
 #define _BV(x) (1<<(x))
@@ -118,5 +120,6 @@ uint8_t write_buffer_to_register(struct nrf24_chip *ts, uint8_t reg, const uint8
 uint8_t read_register(struct nrf24_chip *ts, uint8_t reg);
 uint8_t read_buffer_from_register(struct nrf24_chip *ts, uint8_t reg, uint8_t* buf, uint8_t len);
 int getConfiguration(struct nrf24_chip *ts);
+void assign_command(struct nrf24_chip *ts, int command);
 
 #endif

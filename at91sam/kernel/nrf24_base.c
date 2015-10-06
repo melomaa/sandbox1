@@ -177,6 +177,9 @@ static void nrf24_device_control(struct nrf24_chip *ts)
 			ce(LOW);
 			powerDown(ts);
 			break;
+		case NRF24_SETCHANNEL:
+			setChannel(ts, ts->radioConfig.channel);
+			break;
 		}
 		ts->ctrl_cmd = NRF24_NO_COMMAND;
 	}
@@ -556,6 +559,10 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 				ret = -EBUSY;
 			}
 			break;
+		case TIO_NRF24_SETCHANNEL:
+			ts->radioConfig.channel = *(char*)arg;
+			assign_command(ts, NRF24_SETCHANNEL);
+			break;
 #if 0
 		case TCGETS:
 			ret = 0;
@@ -686,6 +693,23 @@ int default_configuration(struct nrf24_chip *ts)
 	return 0;
 }
 
+void assign_command(struct nrf24_chip *ts, int command)
+{
+	int cnt = 20;
+
+	while (ts->ctrl_cmd != 0 && cnt > 0) {
+		msleep(100);
+		cnt--;
+	}
+	if (cnt > 0) {
+		ts->ctrl_cmd = command;
+		/* Trigger work thread for handling the actual device command */
+		nrf24_dowork(ts);
+	}
+	else {
+		dev_err(&ts->spi->dev, "Failed to assign command %d.", command);
+	}
+}
 
 static const char * nrf24_type(struct uart_port *port)
 {
@@ -789,7 +813,6 @@ static void nrf24_start_tx(struct uart_port *port)
 static void nrf24_stop_rx(struct uart_port *port)
 {
 	struct nrf24_chip *ts;
-	int cnt = 20;
 
 	ts = to_nrf24_struct(port);
 	if (ts == NULL)
@@ -797,18 +820,7 @@ static void nrf24_stop_rx(struct uart_port *port)
 
 	dev_dbg(&ts->spi->dev, "%s\n", __func__);
 
-	while (ts->ctrl_cmd != 0 && cnt > 0) {
-		msleep(100);
-		cnt--;
-	}
-	if (cnt > 0) {
-		ts->ctrl_cmd = NRF24_POWERDOWN;
-		/* Trigger work thread for doing the actual configuration change */
-		nrf24_dowork(ts);
-	}
-	else {
-		dev_err(&ts->spi->dev, "Failed to power off nrf24 module.");
-	}
+	assign_command(ts, NRF24_POWERDOWN);
 }
 
 static void
