@@ -35,8 +35,6 @@ void printDetails(void);
 
 uint8_t ce_pin; /**< "Chip Enable" pin, activates the RX or TX role */
 
-//  bool p_variant; /* False for RF24L01 and true for RF24L01P */
-
 //  bool ack_payload_available; /**< Whether there is an ack payload waiting */
 
 //  uint8_t ack_payload_length; /**< Dynamic size of pending ack payload. */
@@ -261,7 +259,6 @@ static void nrf24_dowork(struct nrf24_chip *ts)
 static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 {
 	struct uart_port *uart = &ts->uart;
-	struct tty_struct *tty = uart->state->port.tty;
 	struct tty_port *tport = &uart->state->port;
 	unsigned long flags;
 
@@ -456,12 +453,9 @@ static irqreturn_t nrf24_irq(int irq, void *data)
 #define to_nrf24_struct(port) \
 		container_of(port, struct nrf24_chip, uart)
 
-//static int nrf24_open(struct inode *inode, struct file *filp)
 static int nrf24_open(struct uart_port *port)
 {
 	struct nrf24_chip *ts = to_nrf24_struct(port);
-
-	printk("Port: %x, ts: %x\n",(int)port,(int)ts);
 
 	if (ts == NULL)
 		return -1;
@@ -485,6 +479,7 @@ static int nrf24_open(struct uart_port *port)
 
   	return 0;
 }
+
 static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned long arg)
 {
 	struct nrf24_chip *ts;
@@ -492,7 +487,7 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 	int ret = -1, cnt = 10;
 	char buf[10];
 
-	printk(" Command %d, pointer %x\n",cmd,(unsigned int)arg);
+	dev_dbg(&ts->spi->dev," Command %d, pointer %x\n",cmd,(unsigned int)arg);
 
 	ts = to_nrf24_struct(port);
 	if (ts == NULL)
@@ -512,6 +507,7 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 	{
 		switch (cmd)
 		{
+#if 1
 		case 'c':
 			dev_info(&spi->dev, TYPE_NAME " Flush buffers.\n");
 			write_register(ts, STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
@@ -525,16 +521,17 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 			dev_info(&spi->dev, TYPE_NAME " Status %x\n",(unsigned int)buf[0]);
 			memcpy((char*)arg,buf,1);
 			ret = 1;
+#endif
 		case TIO_NRF24_ACKPAYLOAD:
 			memcpy(&ts->nioctl, (void*)arg, sizeof(struct nrf24_ioctl));
-			printk("AP(%d): %d (%d)\n",ts->nioctl.pipe,(unsigned int)ts->nioctl.ackPayload,ts->nioctl.apLen);
+			dev_dbg(&ts->spi->dev,"AP(%d): %d (%d)\n",ts->nioctl.pipe,(unsigned int)ts->nioctl.ackPayload,ts->nioctl.apLen);
 			ts->ackPayload = true;
 			nrf24_dowork(ts);
 			ret = 0;
 			break;
 		case TIO_NRF24_PAYLOADSIZE:
 			ts->payload_size = *(char*)arg;
-			printk("Set payload size %d\n", ts->payload_size);
+			dev_dbg(&ts->spi->dev,"Set payload size %d\n", ts->payload_size);
 			break;
 		case TIO_NRF24_GETCONFIG:
 			if (getConfiguration(ts) == 0) {
@@ -564,31 +561,7 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 
 	return ret;
 }
-/*
-static int nrf24_release(struct inode *inode, struct file *filp)
-{
-	write_register(CONFIG,read_register(CONFIG) & ~(_BV(PWR_UP)));
-	return 0;
-}
-*/
-#if 0
-static const struct file_operations nrf24_fops = {
-	.owner =	THIS_MODULE,
-	/* REVISIT switch to aio primitives, so that userspace
-	 * gets more complete API coverage.  It'll simplify things
-	 * too, except for the locking.
-	 */
-	.write =	nrf24dev_write,
-	.read =		nrf24dev_read,
-	.unlocked_ioctl = nrf24dev_ioctl,
-//	.compat_ioctl = spidev_compat_ioctl,
-	.open =		nrf24_open,
-//	.release =	nrf24_release,
-//	.llseek =	no_llseek,
-};
 
-static struct class *nrf24_class;
-#endif
 
 /* ******************************** INIT ********************************* */
 void print_byte_register(const char* name, uint8_t reg, uint8_t qty)
@@ -648,56 +621,55 @@ void printDetails(void)
 int default_configuration(struct nrf24_chip *ts)
 {
 	msleep(5);
-  // Set 1500uS (minimum for 32B payload in ESB@250KBPS) timeouts, to make testing a little easier
-  // WARNING: If this is ever lowered, either 250KBS mode with AA is broken or maximum packet
-  // sizes must never be used. See documentation for a more complete explanation.
-  //write_register(SETUP_RETR,(0b0100 << ARD) | (0b1111 << ARC));
-  setRetries(ts, 5,15);
+	// Set 1500uS (minimum for 32B payload in ESB@250KBPS) timeouts, to make testing a little easier
+	// WARNING: If this is ever lowered, either 250KBS mode with AA is broken or maximum packet
+	// sizes must never be used. See documentation for a more complete explanation.
+	//write_register(SETUP_RETR,(0b0100 << ARD) | (0b1111 << ARC));
+	setRetries(ts, 5,15);
 
-  // Restore our default PA level
-  setPALevel(ts, RF24_PA_MAX ) ;
-  // Determine if this is a p or non-p RF24 module and then
-  // reset our data rate back to default value. This works
-  // because a non-P variant won't allow the data rate to
-  // be set to 250Kbps.
-  if( setDataRate(ts, RF24_250KBPS ) )
-  {
-    ts->p_variant = true ;
-  }
+	// Restore our default PA level
+	setPALevel(ts, RF24_PA_MAX ) ;
+	// Determine if this is a p or non-p RF24 module and then
+	// reset our data rate back to default value. This works
+	// because a non-P variant won't allow the data rate to
+	// be set to 250Kbps.
+	if( setDataRate(ts, RF24_250KBPS ) )
+	{
+		ts->p_variant = true ;
+	}
 
-  // Then set the data rate to the slowest (and most reliable) speed supported by all
-  // hardware.
-  setDataRate(ts, RF24_1MBPS ) ;
+	// Then set the data rate to the slowest (and most reliable) speed supported by all
+	// hardware.
+	setDataRate(ts, RF24_1MBPS ) ;
 
-  // Initialize CRC and request 2-byte (16bit) CRC
-  setCRCLength(ts, RF24_CRC_16 ) ;
- 
-  // Disable dynamic payloads, to match dynamic_payloads_enabled setting
-  toggle_features(ts);
-  //write_register(FEATURE,0 );
-  write_register(ts, DYNPD, 0);
+	// Initialize CRC and request 2-byte (16bit) CRC
+	setCRCLength(ts, RF24_CRC_16 ) ;
 
-  // Reset current status
-  // Notice reset and flush is the last thing we do
-  write_register(ts, STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+	// Disable dynamic payloads, to match dynamic_payloads_enabled setting
+	toggle_features(ts);
+	write_register(ts, DYNPD, 0);
 
-// enable dynamic payloads
-  enableDynamicPayloads(ts);
+	// Reset current status
+	// Notice reset and flush is the last thing we do
+	write_register(ts, STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+
+	// enable dynamic payloads
+	enableDynamicPayloads(ts);
 
 	setAutoAck(ts, 1);
 	enableAckPayload(ts);
-  // Set up default configuration.  Callers can always change it later.
-  // This channel should be universally safe and not bleed over into adjacent
-  // spectrum.
-  setChannel(ts, 0x6e);
+	// Set up default configuration.  Callers can always change it later.
+	// This channel should be universally safe and not bleed over into adjacent
+	// spectrum.
+	setChannel(ts, 0x6e);
 
-  // Open pipes for communication
-  openWritingPipe(ts, 0x00a5b4c370);
-  openReadingPipe(ts, 1, 0x00a5b4c371);
-  openReadingPipe(ts, 2, 0x00a5b4c372);
-  openReadingPipe(ts, 3, 0x00a5b4c373);
+	// Open pipes for communication
+	openWritingPipe(ts, 0x00a5b4c370);
+	openReadingPipe(ts, 1, 0x00a5b4c371);
+	openReadingPipe(ts, 2, 0x00a5b4c372);
+	openReadingPipe(ts, 3, 0x00a5b4c373);
 
-  return 0;
+	return 0;
 }
 
 
@@ -813,7 +785,6 @@ static void nrf24_stop_rx(struct uart_port *port)
 	ce(LOW);
 	powerDown(ts);
 	/* Trigger work thread for doing the actual configuration change */
-	//nrf24_dowork(chan);
 }
 
 static void
@@ -827,7 +798,7 @@ nrf24_set_termios(struct uart_port *port, struct ktermios *termios,
 	ts = to_nrf24_struct(port);
 	spin_lock_irqsave(&ts->uart.lock, flags);
 	/* we are sending char from a workqueue so enable */
-	//ts->uart.state->port.tty->low_latency = 1;
+	ts->uart.state->port.low_latency = 1;
 	/* Update the per-port timeout. */
 	uart_update_timeout(port, termios->c_cflag, 57600);
 	spin_unlock_irqrestore(&ts->uart.lock, flags);
@@ -882,11 +853,9 @@ static int nrf24_register_uart_port(struct nrf24_chip *ts,struct nrf24_platform_
 static int nrf24_probe(struct spi_device *spi)
 {
 	struct nrf24_chip *ts;
-//	struct nrf24_platform_data platdata;
-	struct nrf24_platform_data *pdata; // = &platdata;
+	struct nrf24_platform_data *pdata;
 	int ret;
 	int irq_num;
-	char *tmp;
 	struct device_node *np = spi->dev.of_node;
 
 	ts = kzalloc(sizeof(struct nrf24_chip), GFP_KERNEL);
@@ -899,41 +868,35 @@ static int nrf24_probe(struct spi_device *spi)
 
 	spi_set_drvdata(spi, ts);
 	ts->spi = spi;
- if (np) {
-   pdata = devm_kzalloc(&spi->dev, sizeof(*pdata), GFP_KERNEL);
-         if (!pdata) {
-                 dev_err(&spi->dev, "could not allocate memory for pdata\n");
-                 return (-ENOMEM);
-         }
-	pdata->ce_pin = of_get_named_gpio(np,"ce-gpio", 0);
-        pdata->active_pipes = 7;
-        pdata->combine_pipes = 1;
-        pdata->uartclk = 16000000;
-        pdata->uart_base = 0;
-        printk("Device tree config\n");
-}
-else {
-	/* Get platform data for  module */
-	pdata = (struct nrf24_platform_data*)spi->dev.platform_data;
-}
+	if (np) {
+		pdata = devm_kzalloc(&spi->dev, sizeof(*pdata), GFP_KERNEL);
+		if (!pdata) {
+			dev_err(&spi->dev, "could not allocate memory for pdata\n");
+			return (-ENOMEM);
+		}
+		pdata->ce_pin = of_get_named_gpio(np,"ce-gpio", 0);
+		pdata->active_pipes = 7;
+		pdata->combine_pipes = 1;
+		pdata->uartclk = 16000000;
+		pdata->uart_base = 0;
+		dev_info(&spi->dev, TYPE_NAME " Device tree config\n");
+		spi->dev.platform_data = pdata;
+	}
+	else {
+		/* Get platform data for  module */
+		pdata = (struct nrf24_platform_data*)spi->dev.platform_data;
+	}
 	if (pdata == NULL)
 		return -ENOTTY;
 	printk("%x\n",(unsigned int)pdata);
-//	pdata->uartclk = 16000000;
-//	pdata->uart_base = 0;
-//	printk("%x vs %x\n",(unsigned int)pdata, (unsigned int)spi->controller_data);
-//	pdata = (struct nrf24_platform_data*)spi->controller_data;
-//	ce_pin = 111; /* AT91_PIN_PD15 */
 
-//	tmp = (char*)spi->dev.platform_data;
-	dev_info(&spi->dev, TYPE_NAME " Alias %s\n",spi->modalias);
-	dev_info(&spi->dev, TYPE_NAME " IRQ pin %d (%d)\n",spi->irq, gpio_to_irq(spi->irq));
-//	dev_info(&spi->dev, TYPE_NAME " %x %x %x %x\n",tmp[0],tmp[1],tmp[2],tmp[3]);
-	dev_info(&spi->dev, TYPE_NAME " CE pin %d\n",pdata->ce_pin);
-	dev_info(&spi->dev, TYPE_NAME " pipes %d\n",pdata->active_pipes);
-	dev_info(&spi->dev, TYPE_NAME " combo %d\n",pdata->combine_pipes);
-	dev_info(&spi->dev, TYPE_NAME " uclk %d\n",pdata->uartclk);
-	dev_info(&spi->dev, TYPE_NAME " ubase %d\n",pdata->uart_base);
+	dev_info(&spi->dev, "Alias %s\n",spi->modalias);
+	dev_info(&spi->dev, "IRQ pin %d (%d)\n",spi->irq, gpio_to_irq(spi->irq));
+	dev_info(&spi->dev, "CE pin %d\n",pdata->ce_pin);
+	dev_info(&spi->dev, "pipes %d\n",pdata->active_pipes);
+	dev_info(&spi->dev, "combo %d\n",pdata->combine_pipes);
+	dev_info(&spi->dev, "uclk %d\n",pdata->uartclk);
+	dev_info(&spi->dev, "ubase %d\n",pdata->uart_base);
 	ce_pin = pdata->ce_pin;
 
 
@@ -958,24 +921,14 @@ else {
 	ts->queue = 0;
 
 	default_configuration(ts);
-#if 0
-	/* If we can allocate a minor number, hook up this device.
-	 * Reusing minors is fine so long as udev or mdev is working.
-	 */
 
-	ts->devt = MKDEV(SPIDEV_MAJOR, minor);
-	dev = device_create(nrf24_class, &spi->dev, ts->devt,
-			ts, "radio%d",
-			spi->chip_select);
-	//		ret = IS_ERR(dev) ? PTR_ERR(dev) : 0;
-#endif
 	ret = nrf24_register_uart_port(ts, pdata, 0);
 	if (ret)
 		goto exit_destroy;
 
 	/* Setup IRQ. Actually we have a low active IRQ, but we want
 	 * one shot behaviour */
-	irq_num = gpio_to_irq(ts->spi->irq); // 57 -> 105
+	irq_num = gpio_to_irq(ts->spi->irq);
 	if (irq_num < 0) {
 		dev_err(&ts->spi->dev, "GPIO to IRQ failed\n");
 	}
@@ -984,22 +937,14 @@ else {
 				IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING | IRQF_SHARED,
 				"nrf24", ts)) {
 			dev_err(&ts->spi->dev, "IRQ request failed\n");
-			//		destroy_workqueue(chan->workqueue);
-			//		chan->workqueue = NULL;
-			//		return -EBUSY;
 			goto exit_uart0;
 		}
 	}
 
-
-
 	dev_info(&spi->dev, TYPE_NAME " at CS%d (irq %d), 2.4GHz radio link\n",
 			spi->chip_select, spi->irq);
 
-
 	dev_info(&spi->dev, TYPE_NAME " active pipe mask: %x\n",pdata->active_pipes);
-	//printk(" ts pointer %x\n",(int)ts);
-
 
 	return 0;
 
@@ -1009,39 +954,34 @@ exit_destroy:
 	dev_set_drvdata(&spi->dev, NULL);
 	kfree(ts);
 	gpio_free(ce_pin);
-	return 0;
+	if (np) {
+		kfree(pdata);
+	}
+	return -EBUSY;
 }
 
 static int nrf24_remove(struct spi_device *spi)
 {
 	struct nrf24_chip *ts = spi_get_drvdata(spi);
 	int ret;
+	struct nrf24_platform_data *pdata;
 
 	if (ts == NULL)
 		return -ENODEV;
-	printk("ts %x\n",(int)ts);
+	dev_dbg(&spi->dev,"ts %x\n",(int)ts);
 
 	if (ts->spi == NULL)
 		return -ENODEV;
-	printk("ts->spi %x\n",(int)ts->spi);
+	dev_dbg(&spi->dev,"ts->spi %x\n",(int)ts->spi);
 
-	printk("ts->spi->irq %d\n",(int)ts->spi->irq);
+	dev_dbg(&spi->dev,"ts->spi->irq %d\n",(int)ts->spi->irq);
 
 	if (&ts->lock == NULL)
 		return -ENODEV;
-	printk("ts->lock %x\n",(int)&ts->lock);
-#if 0
-	if (nrf24_class == NULL)
-		return -ENODEV;
-	printk("nrf24_class %x\n",(int)nrf24_class);
+	dev_dbg(&spi->dev,"ts->lock %x\n",(int)&ts->lock);
 
-	printk("ts->devt %x\n",(int)ts->devt);
-#endif
 	/* Free the interrupt */
 	free_irq(gpio_to_irq(ts->spi->irq), ts);
-
-
-
 
 	ret = uart_remove_one_port(&nrf24_uart_driver, &ts->uart);
 	if (ret)
@@ -1053,18 +993,16 @@ static int nrf24_remove(struct spi_device *spi)
 	spi_set_drvdata(spi, NULL);
 	spin_unlock_irq(&ts->lock);
 
-	/* prevent new opens */
-#if 0
-	device_destroy(nrf24_class, ts->devt);
-#endif
-//	clear_bit(MINOR(ts->devt), minors);
-
-
 	kfree(ts->transfers); /* Free the async SPI transfer structures */
 	kfree(ts->spiBuf); /* Free the async SPI transfer buffer */
 	kfree(ts->txbuf); /* Free the transmit buffer */
 	kfree(ts);
 	gpio_free(ce_pin);
+	if (spi->dev.of_node) {
+		pdata = (struct nrf24_platform_data*)spi->dev.platform_data;
+		kfree(pdata);
+		spi->dev.platform_data = NULL;
+	}
 	return 0;
 }
 
@@ -1091,42 +1029,21 @@ static struct spi_driver nrf24_spi_driver = {
 static int __init nrf24_init(void)
 {
 	int status;
-#if 0
-	status = register_chrdev(SPIDEV_MAJOR, DRIVER_NAME, &nrf24_fops);
-	if (status < 0)
-		return status;
-	nrf24_class = class_create(THIS_MODULE, "nrf24dev");
-	if (IS_ERR(nrf24_class)) {
-		unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
-		return PTR_ERR(nrf24_class);
-	}
-#endif
 	int ret = uart_register_driver(&nrf24_uart_driver);
-		if (ret)
-			return ret;
+
+	if (ret)
+		return ret;
 
 	status = spi_register_driver(&nrf24_spi_driver);
-#if 0
-	if (status < 0) {
 
-		class_destroy(nrf24_class);
-		unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
-	}
-#endif
 	return status;
 }
 
 /* Driver exit function */
 static void __exit nrf24_exit(void)
 {
-	printk("driver name %s\n",nrf24_spi_driver.driver.name);
 	spi_unregister_driver(&nrf24_spi_driver);
 	uart_unregister_driver(&nrf24_uart_driver);
-#if 0
-	printk("Exit  nrf24_class %x\n",(int)nrf24_class);
-	class_destroy(nrf24_class);
-	unregister_chrdev(SPIDEV_MAJOR, nrf24_spi_driver.driver.name);
-#endif
 }
 
 /* register after spi postcore initcall and before
