@@ -53,7 +53,6 @@ struct nrf24_platform_data {
 	u8	active_pipes;
 	u8	combine_pipes;
 	unsigned int	uartclk;
-	/* uart line number of the first channel */
 	unsigned	uart_base;
 };
 
@@ -105,22 +104,6 @@ struct nrf24_chip {
 	bool wide_band; /* 2Mbs data rate in use? */
 	struct nrf24_config	radioConfig;
 };
-
-#if 0
-struct nrf24_platform_data {
-	unsigned int	uartclk;
-	/* uart line number of the first channel */
-	unsigned	uart_base;
-};
-#endif
-
-/*
-typedef struct nrf24_configuration {
-	int payload;
-	
-}nrf24_config_t;
-*/
-
 
 void ce(int level);
 int nrf24_write_from_buf(struct nrf24_chip *ts, u8 *buf, u8 len);

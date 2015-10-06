@@ -1,5 +1,5 @@
 
-#include "nrf24.h"
+#include "nrf24_base.h"
 #include <linux/platform_device.h>
 #include <linux/workqueue.h>
 #include <linux/freezer.h>
@@ -888,7 +888,6 @@ static int nrf24_probe(struct spi_device *spi)
 	}
 	if (pdata == NULL)
 		return -ENOTTY;
-	printk("%x\n",(unsigned int)pdata);
 
 	dev_info(&spi->dev, "Alias %s\n",spi->modalias);
 	dev_info(&spi->dev, "IRQ pin %d (%d)\n",spi->irq, gpio_to_irq(spi->irq));

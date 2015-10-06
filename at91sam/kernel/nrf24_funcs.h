@@ -8,7 +8,7 @@
 #ifndef NRF24_FUNCS_H_
 #define NRF24_FUNCS_H_
 
-#include "nrf24.h"
+#include "nrf24_base.h"
 
 uint8_t flush_rx(struct nrf24_chip *ts);
 
