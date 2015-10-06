@@ -25,6 +25,11 @@ enum {
 	TIO_NRF24_GETCONFIG,
 };
 
+enum {
+	NRF24_NO_COMMAND,
+	NRF24_POWERDOWN,
+};
+
 #define _BV(x) (1<<(x))
 
 /**
@@ -88,6 +93,7 @@ struct nrf24_chip {
 	u8		pending;	/* Async transfer active (only one at a time)*/
 	u8		state;		/* Which state (async spi) is being handled */
 	u8 		queue;		/* Queued interrupt */
+	u8		ctrl_cmd;	/* Device control command */
 	struct spi_message      message; /* Message struct for async transfer */
 	struct spi_transfer     *transfers; /* Transfer structs for the async message */
 	u8 		*spiBuf;	/* Buffer for message data */

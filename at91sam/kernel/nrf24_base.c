@@ -169,6 +169,19 @@ static void nrf24_set_ackpayload(struct nrf24_chip *ts)
 	}
 }
 
+static void nrf24_device_control(struct nrf24_chip *ts)
+{
+	if (ts->ctrl_cmd != NRF24_NO_COMMAND) {
+		switch(ts->ctrl_cmd) {
+		case NRF24_POWERDOWN:
+			ce(LOW);
+			powerDown(ts);
+			break;
+		}
+		ts->ctrl_cmd = NRF24_NO_COMMAND;
+	}
+}
+
 static void nrf24_handle_tx(struct nrf24_chip *ts)
 {
 	struct uart_port *uart = &ts->uart;
@@ -247,6 +260,7 @@ static void nrf24_work_routine(struct work_struct *w)
 
 	nrf24_set_ackpayload(ts);
 	nrf24_handle_tx(ts);
+	nrf24_device_control(ts);
 }
 
 /* Trigger work thread*/
@@ -775,6 +789,7 @@ static void nrf24_start_tx(struct uart_port *port)
 static void nrf24_stop_rx(struct uart_port *port)
 {
 	struct nrf24_chip *ts;
+	int cnt = 20;
 
 	ts = to_nrf24_struct(port);
 	if (ts == NULL)
@@ -782,9 +797,18 @@ static void nrf24_stop_rx(struct uart_port *port)
 
 	dev_dbg(&ts->spi->dev, "%s\n", __func__);
 
-	ce(LOW);
-	powerDown(ts);
-	/* Trigger work thread for doing the actual configuration change */
+	while (ts->ctrl_cmd != 0 && cnt > 0) {
+		msleep(100);
+		cnt--;
+	}
+	if (cnt > 0) {
+		ts->ctrl_cmd = NRF24_POWERDOWN;
+		/* Trigger work thread for doing the actual configuration change */
+		nrf24_dowork(ts);
+	}
+	else {
+		dev_err(&ts->spi->dev, "Failed to power off nrf24 module.");
+	}
 }
 
 static void
@@ -918,6 +942,7 @@ static int nrf24_probe(struct spi_device *spi)
 
 	ts->pending = 0;
 	ts->queue = 0;
+	ts->ctrl_cmd = NRF24_NO_COMMAND;
 
 	default_configuration(ts);
 
