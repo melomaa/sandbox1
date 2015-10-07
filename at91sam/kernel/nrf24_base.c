@@ -475,7 +475,7 @@ static int nrf24_open(struct uart_port *port)
 	struct nrf24_chip *ts = to_nrf24_struct(port);
 
 	if (ts == NULL)
-		return -1;
+		return -ECHILD;
   	powerUp(ts); //Power up by default when open() is called
 
   	ts->ackPayload = false;
@@ -501,14 +501,15 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 {
 	struct nrf24_chip *ts;
 	struct spi_device	*spi;
-	int ret = -1, cnt = 10;
+	int ret = -ENOSYS, cnt = 10;
 	char buf[10];
 
-	dev_dbg(&ts->spi->dev," Command %d, pointer %x\n",cmd,(unsigned int)arg);
-
 	ts = to_nrf24_struct(port);
-	if (ts == NULL)
-		return ret;
+	if (ts == NULL) {
+		return -ECHILD;
+	}
+
+	dev_info(&ts->spi->dev," Command 0x%x, pointer %x\n",cmd,(unsigned int)arg);
 
 	spin_lock_irq(&ts->lock);
 	spi = spi_dev_get(ts->spi);
@@ -549,6 +550,7 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 		case TIO_NRF24_PAYLOADSIZE:
 			ts->payload_size = *(char*)arg;
 			dev_dbg(&ts->spi->dev,"Set payload size %d\n", ts->payload_size);
+			ret = 0;
 			break;
 		case TIO_NRF24_GETCONFIG:
 			if (getConfiguration(ts) == 0) {
@@ -562,6 +564,7 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 		case TIO_NRF24_SETCHANNEL:
 			ts->radioConfig.channel = *(char*)arg;
 			assign_command(ts, NRF24_SETCHANNEL);
+			ret = 0;
 			break;
 #if 0
 		case TCGETS:
