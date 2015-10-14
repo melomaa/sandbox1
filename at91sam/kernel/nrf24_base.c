@@ -148,6 +148,38 @@ uint8_t write_payload(struct nrf24_chip *ts, const void* payload, uint8_t len)
 
 int nrf24_write_read(struct nrf24_chip *ts, u8 *txbuf, unsigned n_tx, u8 *spibuf, unsigned n_rx);
 
+static uint8_t request_comm(struct nrf24_chip *ts, int timeout_ms)
+{
+	int cnt = (int)(timeout_ms/50);
+	while(cnt && ts->pending) {
+		msleep(50);
+		cnt--;
+	}
+
+	if (cnt > 0)
+	{
+		ts->pending = 1;
+		return 0;
+	}
+	else {
+		dev_err(&ts->spi->dev, "%s: Timeout waiting for comm.\n", __func__);
+	}
+	return 1;
+}
+
+static void release_comm(struct nrf24_chip *ts) {
+	unsigned char localBuf[2];
+	if (ts->queue) {
+		ts->queue = 0;
+		localBuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
+		nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
+	}
+	else {
+		ts->pending = 0;
+	}
+}
+
+
 static void nrf24_set_ackpayload(struct nrf24_chip *ts)
 {
 	int status;
@@ -172,14 +204,26 @@ static void nrf24_set_ackpayload(struct nrf24_chip *ts)
 static void nrf24_device_control(struct nrf24_chip *ts)
 {
 	if (ts->ctrl_cmd != NRF24_NO_COMMAND) {
-		switch(ts->ctrl_cmd) {
-		case NRF24_POWERDOWN:
-			ce(LOW);
-			powerDown(ts);
-			break;
-		case NRF24_SETCHANNEL:
-			setChannel(ts, ts->radioConfig.channel);
-			break;
+		if (!request_comm(ts, 1000)) {
+			switch(ts->ctrl_cmd) {
+			case NRF24_POWERDOWN:
+				ce(LOW);
+				//powerDown(ts);
+				break;
+			case NRF24_SETCHANNEL:
+				ce(LOW);
+				powerDown(ts);
+				write_register(ts, STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+				setChannel(ts, ts->radioConfig.channel);
+				// Flush buffers
+				flush_rx(ts);
+				flush_tx(ts);
+				powerUp(ts);
+				// Go!
+				ce(HIGH);
+				break;
+			}
+			release_comm(ts);
 		}
 		ts->ctrl_cmd = NRF24_NO_COMMAND;
 	}
@@ -261,9 +305,14 @@ static void nrf24_work_routine(struct work_struct *w)
 {
 	struct nrf24_chip *ts = container_of(w, struct nrf24_chip, work);
 
-	nrf24_set_ackpayload(ts);
-	nrf24_handle_tx(ts);
-	nrf24_device_control(ts);
+	if (!request_comm(ts, 1000)) {
+		nrf24_set_ackpayload(ts);
+		nrf24_handle_tx(ts);
+		release_comm(ts);
+	}
+	else {
+		dev_err(&ts->spi->dev,"Device control failed.\n");
+	}
 }
 
 /* Trigger work thread*/
@@ -331,10 +380,11 @@ void nrf24_callback(void *data)
 	  }
 	  else if (chipStatus & (1<<TX_DS)) {
 		  dev_dbg(&ts->spi->dev, "TX data send\n");
-		  nrf24_dowork(ts);
+		  nrf24_handle_tx(ts);
+		//  nrf24_dowork(ts);
 		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
-		  		  localBuf[1] = 0x70;
-		  		  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
+		  localBuf[1] = 0x70;
+		  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
 	  }
 	  else if (chipStatus & 0x70) {
 		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
@@ -359,12 +409,14 @@ void nrf24_callback(void *data)
 	  break;
   case R_RX_PAYLOAD:
 	  async_handle_rx(ts,dataLen);
-	  if (chipStatus & 0x70) {
-		  localBuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
-		  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
-	  }
+	  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
+	  localBuf[1] = 0x70;
+	  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
 	  break;
-
+  case STATUSCLEAR:
+	  localBuf[0] = ( R_REGISTER | ( REGISTER_MASK & STATUS) );
+	  nrf24_write_read(ts,localBuf,1,ts->spiBuf,1);
+	  break;
   default:
 	  if (ts->queue) {
 		  ts->queue = 0;
@@ -474,16 +526,19 @@ static int nrf24_open(struct uart_port *port)
 {
 	struct nrf24_chip *ts = to_nrf24_struct(port);
 
+	printk("%s\n", __func__);
 	if (ts == NULL)
 		return -ECHILD;
-  	powerUp(ts); //Power up by default when open() is called
+	powerUp(ts); //Power up by default when open() is called
 
-  	ts->ackPayload = false;
-	/* Initialize work queue */
-	ts->workqueue = create_freezable_workqueue("nrf24");
-	if (!ts->workqueue) {
-		dev_err(&ts->spi->dev, "Workqueue creation failed\n");
-		return -EBUSY;
+	ts->ackPayload = false;
+	if (ts->workqueue == NULL) {
+		/* Initialize work queue */
+		ts->workqueue = create_freezable_workqueue("nrf24");
+		if (!ts->workqueue) {
+			dev_err(&ts->spi->dev, "Workqueue creation failed\n");
+			return -EBUSY;
+		}
 	}
 	INIT_WORK(&ts->work, nrf24_work_routine);
 
@@ -516,13 +571,7 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 	spin_unlock_irq(&ts->lock);
 
 
-	while(cnt && ts->pending) {
-		msleep(10);
-		cnt--;
-	}
 
-	if (cnt > 0)
-	{
 		switch (cmd)
 		{
 #if 1
@@ -535,10 +584,21 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 			ret = 0;
 			break;
 		case 's':
+			while(cnt && ts->pending) {
+				msleep(10);
+				cnt--;
+			}
+
+			if (cnt > 0)
+			{
 			buf[0] = get_status(ts);
 			dev_info(&spi->dev, TYPE_NAME " Status %x\n",(unsigned int)buf[0]);
 			memcpy((char*)arg,buf,1);
 			ret = 1;
+			}
+			else {
+				ret = -EAGAIN;
+			}
 #endif
 		case TIO_NRF24_ACKPAYLOAD:
 			memcpy(&ts->nioctl, (void*)arg, sizeof(struct nrf24_ioctl));
@@ -578,10 +638,6 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 			ret = -ENOIOCTLCMD;;
 			break;
 		}
-	}
-	else {
-		ret = -EAGAIN;
-	}
 
 	return ret;
 }
@@ -707,7 +763,8 @@ void assign_command(struct nrf24_chip *ts, int command)
 	if (cnt > 0) {
 		ts->ctrl_cmd = command;
 		/* Trigger work thread for handling the actual device command */
-		nrf24_dowork(ts);
+		//nrf24_dowork(ts);
+		nrf24_device_control(ts);
 	}
 	else {
 		dev_err(&ts->spi->dev, "Failed to assign command %d.", command);
@@ -754,11 +811,15 @@ static void nrf24_shutdown(struct uart_port *port)
 
 	ts = to_nrf24_struct(port);
 	BUG_ON(!ts);
-	if (ts->workqueue) {
-		/* Flush and destroy work queue */
-		flush_workqueue(ts->workqueue);
-		destroy_workqueue(ts->workqueue);
-		ts->workqueue = NULL;
+	if (!request_comm(ts,1000)) {
+		if (ts->workqueue) {
+			/* Flush and destroy work queue */
+			flush_workqueue(ts->workqueue);
+			destroy_workqueue(ts->workqueue);
+			ts->workqueue = NULL;
+		}
+		release_comm(ts);
+		printk("Workqueue removed\n");
 	}
 	return;
 }
@@ -807,7 +868,7 @@ static void nrf24_start_tx(struct uart_port *port)
 	if (ts == NULL)
 			return;
 
-	dev_dbg(&ts->spi->dev, "%s\n", __func__);
+	dev_info(&ts->spi->dev, "%s\n", __func__);
 
 	/* Trigger work thread for sending data */
 	nrf24_dowork(ts);
@@ -821,7 +882,7 @@ static void nrf24_stop_rx(struct uart_port *port)
 	if (ts == NULL)
 			return;
 
-	dev_dbg(&ts->spi->dev, "%s\n", __func__);
+	dev_info(&ts->spi->dev, "%s\n", __func__);
 
 	assign_command(ts, NRF24_POWERDOWN);
 }
@@ -1007,25 +1068,31 @@ static int nrf24_remove(struct spi_device *spi)
 
 	if (ts == NULL)
 		return -ENODEV;
-	dev_dbg(&spi->dev,"ts %x\n",(int)ts);
+	dev_info(&spi->dev,"ts %x\n",(int)ts);
 
 	if (ts->spi == NULL)
 		return -ENODEV;
-	dev_dbg(&spi->dev,"ts->spi %x\n",(int)ts->spi);
+	dev_info(&spi->dev,"ts->spi %x\n",(int)ts->spi);
 
-	dev_dbg(&spi->dev,"ts->spi->irq %d\n",(int)ts->spi->irq);
+	if (request_comm(ts, 2000)) {
+		dev_err(&spi->dev,"Comm clear timeout at exit\n");
+	}
+
+	dev_info(&spi->dev,"ts->spi->irq %d\n",(int)ts->spi->irq);
 
 	if (&ts->lock == NULL)
 		return -ENODEV;
-	dev_dbg(&spi->dev,"ts->lock %x\n",(int)&ts->lock);
+	dev_info(&spi->dev,"ts->lock %x\n",(int)&ts->lock);
 
 	/* Free the interrupt */
 	free_irq(gpio_to_irq(ts->spi->irq), ts);
 
+	dev_info(&spi->dev,"IRQ free done\n");
 	ret = uart_remove_one_port(&nrf24_uart_driver, &ts->uart);
 	if (ret)
 		return ret;
 
+	dev_info(&spi->dev,"Uart remove done\n");
 	/* make sure ops on existing fds can abort cleanly */
 	spin_lock_irq(&ts->lock);
 	ts->spi = NULL;

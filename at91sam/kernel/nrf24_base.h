@@ -33,6 +33,7 @@ enum {
 };
 
 #define _BV(x) (1<<(x))
+#define	STATUSCLEAR	( W_REGISTER | ( REGISTER_MASK & STATUS))
 
 /**
  * Power Amplifier level.
