@@ -325,7 +325,11 @@ static void nrf24_dowork(struct nrf24_chip *ts)
 static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 {
 	struct uart_port *uart = &ts->uart;
-	struct tty_port *tport = &uart->state->port;
+#ifdef KERNEL_PRE_3v9
+	struct tty_struct *tty = uart->state->port.tty;
+#else
+	struct tty_port *tty = &uart->state->port;
+#endif
 	unsigned long flags;
 
 	/* Check that transfer was successful */
@@ -346,7 +350,7 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 
 	spin_lock_irqsave(&uart->lock, flags);
 	/* Insert received data */
-	tty_insert_flip_string(tport, &ts->spiBuf[1], rxlvl);
+	tty_insert_flip_string(tty, &ts->spiBuf[1], rxlvl);
 	/* Update RX counter */
 	uart->icount.rx += rxlvl;
 
@@ -354,7 +358,7 @@ static void async_handle_rx(struct nrf24_chip *ts, int rxlvl)
 
 	/* Push the received data to receivers */
 	if (rxlvl)
-		tty_flip_buffer_push(tport);
+		tty_flip_buffer_push(tty);
 
 }
 
@@ -898,7 +902,11 @@ nrf24_set_termios(struct uart_port *port, struct ktermios *termios,
 	ts = to_nrf24_struct(port);
 	spin_lock_irqsave(&ts->uart.lock, flags);
 	/* we are sending char from a workqueue so enable */
+#ifdef KERNEL_PRE_3v9
+	ts->uart.state->port.tty->low_latency = 1;
+#else
 	ts->uart.state->port.low_latency = 1;
+#endif
 	/* Update the per-port timeout. */
 	uart_update_timeout(port, termios->c_cflag, 57600);
 	spin_unlock_irqrestore(&ts->uart.lock, flags);
