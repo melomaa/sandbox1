@@ -204,26 +204,23 @@ static void nrf24_set_ackpayload(struct nrf24_chip *ts)
 static void nrf24_device_control(struct nrf24_chip *ts)
 {
 	if (ts->ctrl_cmd != NRF24_NO_COMMAND) {
-		if (!request_comm(ts, 1000)) {
-			switch(ts->ctrl_cmd) {
-			case NRF24_POWERDOWN:
-				ce(LOW);
-				//powerDown(ts);
-				break;
-			case NRF24_SETCHANNEL:
-				ce(LOW);
-				powerDown(ts);
-				write_register(ts, STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
-				setChannel(ts, ts->radioConfig.channel);
-				// Flush buffers
-				flush_rx(ts);
-				flush_tx(ts);
-				powerUp(ts);
-				// Go!
-				ce(HIGH);
-				break;
-			}
-			release_comm(ts);
+		switch(ts->ctrl_cmd) {
+		case NRF24_POWERDOWN:
+			ce(LOW);
+			//powerDown(ts);
+			break;
+		case NRF24_SETCHANNEL:
+			ce(LOW);
+			powerDown(ts);
+			write_register(ts, STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+			setChannel(ts, ts->radioConfig.channel);
+			// Flush buffers
+			flush_rx(ts);
+			flush_tx(ts);
+			powerUp(ts);
+			// Go!
+			ce(HIGH);
+			break;
 		}
 		ts->ctrl_cmd = NRF24_NO_COMMAND;
 	}
@@ -308,6 +305,7 @@ static void nrf24_work_routine(struct work_struct *w)
 	if (!request_comm(ts, 1000)) {
 		nrf24_set_ackpayload(ts);
 		nrf24_handle_tx(ts);
+		nrf24_device_control(ts);
 		release_comm(ts);
 	}
 	else {
@@ -536,13 +534,17 @@ static int nrf24_open(struct uart_port *port)
 	powerUp(ts); //Power up by default when open() is called
 
 	ts->ackPayload = false;
-	if (ts->workqueue == NULL) {
-		/* Initialize work queue */
-		ts->workqueue = create_freezable_workqueue("nrf24");
-		if (!ts->workqueue) {
-			dev_err(&ts->spi->dev, "Workqueue creation failed\n");
-			return -EBUSY;
-		}
+	if (ts->workqueue) {
+		/* Flush and destroy work queue */
+		flush_workqueue(ts->workqueue);
+		destroy_workqueue(ts->workqueue);
+		ts->workqueue = NULL;
+	}
+	/* Initialize work queue */
+	ts->workqueue = create_freezable_workqueue("nrf24");
+	if (!ts->workqueue) {
+		dev_err(&ts->spi->dev, "Workqueue creation failed\n");
+		return -EBUSY;
 	}
 	INIT_WORK(&ts->work, nrf24_work_routine);
 
@@ -627,8 +629,19 @@ static int nrf24dev_ioctl(struct uart_port *port, unsigned int cmd, unsigned lon
 			break;
 		case TIO_NRF24_SETCHANNEL:
 			ts->radioConfig.channel = *(char*)arg;
-			assign_command(ts, NRF24_SETCHANNEL);
-			ret = 0;
+			if (assign_command(ts, NRF24_SETCHANNEL) == 0) {
+				if (!request_comm(ts, 1000)) {
+					nrf24_device_control(ts);
+					release_comm(ts);
+					ret = 0;
+				}
+				else {
+					ret = -EBUSY;
+				}
+			}
+			else {
+				ret = -EBUSY;
+			}
 			break;
 #if 0
 		case TCGETS:
@@ -756,7 +769,7 @@ int default_configuration(struct nrf24_chip *ts)
 	return 0;
 }
 
-void assign_command(struct nrf24_chip *ts, int command)
+int assign_command(struct nrf24_chip *ts, int command)
 {
 	int cnt = 20;
 
@@ -766,13 +779,12 @@ void assign_command(struct nrf24_chip *ts, int command)
 	}
 	if (cnt > 0) {
 		ts->ctrl_cmd = command;
-		/* Trigger work thread for handling the actual device command */
-		//nrf24_dowork(ts);
-		nrf24_device_control(ts);
 	}
 	else {
 		dev_err(&ts->spi->dev, "Failed to assign command %d.", command);
+		return -1;
 	}
+	return 0;
 }
 
 static const char * nrf24_type(struct uart_port *port)
@@ -815,14 +827,13 @@ static void nrf24_shutdown(struct uart_port *port)
 
 	ts = to_nrf24_struct(port);
 	BUG_ON(!ts);
-	if (!request_comm(ts,1000)) {
+	if (!ts->pending) {
 		if (ts->workqueue) {
 			/* Flush and destroy work queue */
 			flush_workqueue(ts->workqueue);
 			destroy_workqueue(ts->workqueue);
 			ts->workqueue = NULL;
 		}
-		release_comm(ts);
 		printk("Workqueue removed\n");
 	}
 	return;
@@ -888,7 +899,13 @@ static void nrf24_stop_rx(struct uart_port *port)
 
 	dev_info(&ts->spi->dev, "%s\n", __func__);
 
-	assign_command(ts, NRF24_POWERDOWN);
+	if (assign_command(ts, NRF24_POWERDOWN) == 0) {
+		/* Trigger work thread for handling the actual device command */
+		nrf24_dowork(ts);
+	}
+	else {
+		dev_info(&ts->spi->dev, "Poweroff command failed\n");
+	}
 }
 
 static void

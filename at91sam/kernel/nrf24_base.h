@@ -121,6 +121,6 @@ uint8_t write_buffer_to_register(struct nrf24_chip *ts, uint8_t reg, const uint8
 uint8_t read_register(struct nrf24_chip *ts, uint8_t reg);
 uint8_t read_buffer_from_register(struct nrf24_chip *ts, uint8_t reg, uint8_t* buf, uint8_t len);
 int getConfiguration(struct nrf24_chip *ts);
-void assign_command(struct nrf24_chip *ts, int command);
+int assign_command(struct nrf24_chip *ts, int command);
 
 #endif
