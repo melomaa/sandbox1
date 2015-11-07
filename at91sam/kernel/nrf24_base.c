@@ -204,24 +204,27 @@ static void nrf24_set_ackpayload(struct nrf24_chip *ts)
 static void nrf24_device_control(struct nrf24_chip *ts)
 {
 	if (ts->ctrl_cmd != NRF24_NO_COMMAND) {
-		switch(ts->ctrl_cmd) {
-		case NRF24_POWERDOWN:
-			ce(LOW);
-			//powerDown(ts);
-			break;
-		case NRF24_SETCHANNEL:
-			ce(LOW);
-			powerDown(ts);
-			write_register(ts, STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
-			setChannel(ts, ts->radioConfig.channel);
-			// Flush buffers
-			flush_rx(ts);
-			flush_tx(ts);
-			powerUp(ts);
-			// Go!
-			ce(HIGH);
-			break;
-		}
+//		if (!request_comm(ts, 1000)) {
+			switch(ts->ctrl_cmd) {
+			case NRF24_POWERDOWN:
+				ce(LOW);
+				//powerDown(ts);
+				break;
+			case NRF24_SETCHANNEL:
+				ce(LOW);
+				powerDown(ts);
+				write_register(ts, STATUS,_BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
+				setChannel(ts, ts->radioConfig.channel);
+				// Flush buffers
+				flush_rx(ts);
+				flush_tx(ts);
+				powerUp(ts);
+				// Go!
+				ce(HIGH);
+				break;
+			}
+//			release_comm(ts);
+//		}
 		ts->ctrl_cmd = NRF24_NO_COMMAND;
 	}
 }
@@ -382,8 +385,8 @@ void nrf24_callback(void *data)
 	  }
 	  else if (chipStatus & (1<<TX_DS)) {
 		  dev_dbg(&ts->spi->dev, "TX data send\n");
-		  nrf24_handle_tx(ts);
-		//  nrf24_dowork(ts);
+		//  nrf24_handle_tx(ts);
+		  nrf24_dowork(ts);
 		  localBuf[0] = ( W_REGISTER | ( REGISTER_MASK & STATUS) );
 		  localBuf[1] = 0x70;
 		  nrf24_write_read(ts,localBuf,2,ts->spiBuf,1);
@@ -540,12 +543,14 @@ static int nrf24_open(struct uart_port *port)
 		destroy_workqueue(ts->workqueue);
 		ts->workqueue = NULL;
 	}
-	/* Initialize work queue */
-	ts->workqueue = create_freezable_workqueue("nrf24");
-	if (!ts->workqueue) {
-		dev_err(&ts->spi->dev, "Workqueue creation failed\n");
-		return -EBUSY;
-	}
+//	if (ts->workqueue == NULL) {
+		/* Initialize work queue */
+		ts->workqueue = create_freezable_workqueue("nrf24");
+		if (!ts->workqueue) {
+			dev_err(&ts->spi->dev, "Workqueue creation failed\n");
+			return -EBUSY;
+		}
+//	}
 	INIT_WORK(&ts->work, nrf24_work_routine);
 
   	msleep(2);
@@ -779,6 +784,9 @@ int assign_command(struct nrf24_chip *ts, int command)
 	}
 	if (cnt > 0) {
 		ts->ctrl_cmd = command;
+		/* Trigger work thread for handling the actual device command */
+		//nrf24_dowork(ts);
+//		nrf24_device_control(ts);
 	}
 	else {
 		dev_err(&ts->spi->dev, "Failed to assign command %d.", command);
@@ -900,7 +908,6 @@ static void nrf24_stop_rx(struct uart_port *port)
 	dev_info(&ts->spi->dev, "%s\n", __func__);
 
 	if (assign_command(ts, NRF24_POWERDOWN) == 0) {
-		/* Trigger work thread for handling the actual device command */
 		nrf24_dowork(ts);
 	}
 	else {
