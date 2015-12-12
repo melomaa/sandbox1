@@ -280,7 +280,7 @@ void openReadingPipe(struct nrf24_chip *ts, uint8_t child, uint64_t address)
 void startListening(struct nrf24_chip *ts)
 {
 	ce(LOW);
-	msleep(1);
+
   write_register(ts, CONFIG, read_register(ts, CONFIG) | _BV(PWR_UP) | _BV(PRIM_RX));
   write_register(ts, STATUS, _BV(RX_DR) | _BV(TX_DS) | _BV(MAX_RT) );
 
@@ -302,7 +302,6 @@ void startListening(struct nrf24_chip *ts)
 void stopListening(struct nrf24_chip *ts)
 {
 	  ce(LOW);
-		msleep(1);
 
 	write_register(ts, CONFIG, read_register(ts, CONFIG) & ~_BV(PRIM_RX) );
 	//write_register(EN_RXADDR,read_register(EN_RXADDR) | _BV(0)); // Enable RX on pipe0
